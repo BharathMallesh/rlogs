@@ -126,5 +126,62 @@ jar --create --file rlog4j-all-platforms.jar -C out/classes .
 - **Async by Default**: The `rlog_log` Rust function serializes the message into a lock-free `crossbeam::channel` and immediately returns to Java. The actual disk I/O happens on a dedicated background thread pool managed by Rust `tracing`.
 - **String Handling**: Java strings are UTF-16. We write them natively into an off-heap Arena buffer as UTF-8 bytes to prevent the JVM from allocating byte arrays during garbage collection.
 
+## 📦 Using as a Dependency (Maven/Gradle)
+
+You can include `rlogs` in your other projects as a standard dependency using two methods:
+
+### Method A: Using JitPack (Cloud)
+The easiest way to use `rlogs` in any project without manual installation.
+
+#### Gradle
+1. Add JitPack to your `repositories` block:
+```gradle
+repositories {
+    maven { url 'https://jitpack.io' }
+}
+```
+2. Add the dependency:
+```gradle
+dependencies {
+    implementation 'com.github.BharathMallesh:rlogs:main-SNAPSHOT'
+}
+```
+
+#### Maven
+1. Add the JitPack repository:
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+```
+2. Add the dependency:
+```xml
+<dependency>
+    <groupId>com.github.BharathMallesh</groupId>
+    <artifactId>rlogs</artifactId>
+    <version>main-SNAPSHOT</version>
+</dependency>
+```
+
+---
+
+### Method B: Local Maven Repository
+If you want to install it on your local machine for use in other local projects.
+
+1. Clone the repository.
+2. Run the following command to install it to your `~/.m2/repository`:
+```bash
+./gradlew publishToMavenLocal
+```
+3. In your other project, add `mavenLocal()` to your repositories and include:
+```gradle
+implementation 'org.apache.logging.log4j:rlog4j-all-platforms:0.1.0-SNAPSHOT'
+```
+
+---
+
 ## 📄 License
 This project is open-source. Feel free to use it in your enterprise applications to crush your GC latency!
