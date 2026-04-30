@@ -68,6 +68,10 @@ public class NativeLoader {
         } else if (arch.contains("aarch64") || arch.contains("arm64")) {
             // Java usually uses aarch64 on mac for Apple Silicon
             return "aarch64"; 
+        } else if (arch.contains("arm") || arch.contains("aarch32")) {
+            return "arm";
+        } else if (arch.contains("x86") || arch.contains("i386") || arch.contains("i486") || arch.contains("i586") || arch.contains("i686")) {
+            return "x86";
         }
         return arch;
     }
