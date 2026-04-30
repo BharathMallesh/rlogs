@@ -8,3 +8,5 @@ rlog4j-api/build/
 *.jar
 *.class
 .DS_Store
+gradle-8.7-bin.zip
+gradle-8.7/
