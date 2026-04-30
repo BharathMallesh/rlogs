@@ -1,0 +1,3 @@
+rootProject.name = 'rlog4'
+include 'rlog4j-api'
+include 'rlog-benchmark'

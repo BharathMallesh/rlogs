@@ -1,0 +1,10 @@
+out/
+build/
+target/
+libs/
+.gradle/
+rlog-benchmark/build/
+rlog4j-api/build/
+*.jar
+*.class
+.DS_Store
