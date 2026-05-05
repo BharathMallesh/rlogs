@@ -1,0 +1,4 @@
+jdk:
+  - openjdk22
+install:
+  - ./gradlew :rlog4j-api:publishToMavenLocal
