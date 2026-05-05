@@ -6,7 +6,7 @@
 `rlogs` is a next-generation logging framework built as a **drop-in replacement for Log4j 2**. By offloading log formatting, asynchronous queues, and file I/O to a lock-free native Rust engine, `rlogs` completely eliminates Garbage Collection (GC) pressure and JVM thread blocking, allowing your Java application to achieve unprecedented throughput.
 
 ## ✨ Features
-- ⚡ **Zero-Copy FFM Bridge**: Built on the Java 22 Foreign Function & Memory (FFM) API. Log messages cross the Java/Rust boundary via off-heap memory segments, bypassing the JVM Garbage Collector entirely.
+- ⚡ **Universal Native Bridge**: Built on standard JNI (Java Native Interface). Compatible with all Java versions from 8 to 23+.
 - 🦀 **Rust-Powered Engine**: Built with `crossbeam` lock-free queues and the `tracing` ecosystem. The Java main thread is never blocked by disk I/O.
 - 🔄 **Drop-in Log4j2 Replacement**: Implements the Log4j 2 API Provider interface. Just replace your Log4j `core` JAR with `rlog4j`, keep your existing `LogManager.getLogger()` code, and you're done.
 - 📦 **Zero-Config Cross-Platform**: A single, self-extracting 2MB JAR that runs natively on 7 different hardware architectures without requiring end-users to install anything.
@@ -26,7 +26,7 @@ The `rlog4j-all-platforms.jar` comes pre-bundled with native shared libraries fo
 ## 🚀 How to Use (Integration Guide)
 
 ### 1. Prerequisites
-- **Java 22+** (Required for the stable FFM API).
+- **Java 8+** (Works with Java 8, 11, 17, 21, 22+).
 
 ### 2. Installation
 Add the following JARs to your application's classpath:
@@ -62,10 +62,9 @@ Example:
 ```
 
 ### 4. Running Your Application
-Because `rlogs` uses the Foreign Function & Memory API to execute native code, you **must** grant it native access flags when launching the JVM:
-
+Standard Java launch:
 ```bash
-java --enable-native-access=ALL-UNNAMED -cp "your-app.jar:rlog4j-all-platforms.jar:log4j-api-2.20.0.jar" com.your.App
+java -cp "your-app.jar:rlog4j-all-platforms.jar:log4j-api-2.20.0.jar" com.your.App
 ```
 
 ### 5. Code Example

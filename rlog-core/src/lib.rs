@@ -226,3 +226,58 @@ pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_
         });
     }
 }
+
+// --- JNI WRAPPERS FOR UNIVERSAL JAVA SUPPORT (Java 8+) ---
+use jni::JNIEnv;
+use jni::objects::{JClass, JString};
+use jni::sys::{jint};
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1init(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    rlog_init()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1configure(
+    mut env: JNIEnv,
+    _class: JClass,
+    xml_content: JString,
+) -> jint {
+    if let Ok(xml_str) = env.get_string(&xml_content) {
+        let xml_ptr = xml_str.as_ptr();
+        return rlog_configure(xml_ptr);
+    }
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log(
+    mut env: JNIEnv,
+    _class: JClass,
+    level: jint,
+    message: JString,
+) {
+    if let Ok(msg_str) = env.get_string(&message) {
+        rlog_log(level, msg_str.as_ptr());
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log_1with_1context(
+    mut env: JNIEnv,
+    _class: JClass,
+    level: jint,
+    message: JString,
+    context: JString,
+) {
+    if let Ok(msg_str) = env.get_string(&message) {
+        if let Ok(ctx_str) = env.get_string(&context) {
+            rlog_log_with_context(level, msg_str.as_ptr(), ctx_str.as_ptr());
+        } else {
+            rlog_log(level, msg_str.as_ptr());
+        }
+    }
+}
