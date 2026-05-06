@@ -11,8 +11,8 @@ repositories {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
 }
 
 dependencies {
@@ -23,8 +23,6 @@ dependencies {
 
 test {
     useJUnitPlatform()
-    // FFM might require native access enablement depending on module structure
-    jvmArgs += ["--enable-native-access=ALL-UNNAMED"]
 }
 
 publishing {
