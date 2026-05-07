@@ -11,8 +11,8 @@ repositories {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
 }
 
 dependencies {
@@ -33,6 +33,6 @@ jmh {
     fork = 1
     warmupIterations = 1
     iterations = 1
-    // Pass Java 22 FFM flags and the native library path
-    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Djava.library.path=../rlog-core/target/release"]
+    // Pass the native library path (No FFM flags needed for JNI)
+    jvmArgs = ["-Djava.library.path=../rlog-core/target/release"]
 }
