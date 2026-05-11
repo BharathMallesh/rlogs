@@ -8,6 +8,10 @@ use std::sync::Mutex;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// Global lock-free queue policy: 0 = Discard, 1 = Block
+static QUEUE_POLICY: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, PartialEq)]
 enum RollingPolicy {
@@ -16,11 +20,20 @@ enum RollingPolicy {
     Daily,
 }
 
+#[derive(Clone, PartialEq)]
+enum LayoutType {
+    Pattern,
+    Json,
+}
+
 // Configuration state
 struct RlogConfig {
     file_name: Option<String>,
     rolling_policy: RollingPolicy,
     level: tracing::Level,
+    layout_type: LayoutType,
+    max_size: Option<u64>,
+    max_files: usize,
 }
 
 lazy_static! {
@@ -28,6 +41,9 @@ lazy_static! {
         file_name: None,
         rolling_policy: RollingPolicy::Never,
         level: tracing::Level::TRACE,
+        layout_type: LayoutType::Pattern,
+        max_size: None,
+        max_files: 7,
     });
 }
 
@@ -43,56 +59,94 @@ lazy_static! {
         let (sender, receiver) = bounded::<LogEvent>(1_000_000);
         
         // Read configuration and extract values to move into the thread
-        let (file_name, level, rolling_policy) = {
+        let (file_name, level, rolling_policy, layout_type, max_size, max_files) = {
             let config = CONFIG.lock().unwrap();
-            (config.file_name.clone(), config.level, config.rolling_policy.clone())
+            (config.file_name.clone(), config.level, config.rolling_policy.clone(), config.layout_type.clone(), config.max_size, config.max_files)
         };
         
         thread::spawn(move || {
-            // Set up tracing subscriber
-            let subscriber_builder = tracing_subscriber::fmt()
-                .with_max_level(level);
-            
-            if let Some(file_name) = &file_name {
-                let path = Path::new(file_name);
-                let dir = path.parent().unwrap_or(Path::new("."));
-                let file_prefix = path.file_name().unwrap_or_default();
-                
-                let (non_blocking, _guard) = match rolling_policy {
-                    RollingPolicy::Hourly => {
-                        let appender = tracing_appender::rolling::hourly(dir, file_prefix);
-                        tracing_appender::non_blocking(appender)
-                    },
-                    RollingPolicy::Daily => {
-                        let appender = tracing_appender::rolling::daily(dir, file_prefix);
-                        tracing_appender::non_blocking(appender)
-                    },
-                    RollingPolicy::Never => {
-                        let appender = tracing_appender::rolling::never(dir, file_prefix);
-                        tracing_appender::non_blocking(appender)
+            // Helper to get non_blocking writer
+            let (writer, guard) = if let Some(ref f_name) = file_name {
+                // Ensure parent directory exists
+                let path = Path::new(f_name);
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
                     }
-                };
-
-                subscriber_builder.with_writer(non_blocking).init();
-                Box::leak(Box::new(_guard));
+                }
+                
+                if let Some(limit) = max_size {
+                    let condition = rolling_file::RollingConditionBasic::new().max_size(limit);
+                    let appender = rolling_file::RollingFileAppender::new(f_name, condition, max_files).unwrap();
+                    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+                    (Some(non_blocking), Some(guard))
+                } else {
+                    let path = Path::new(f_name);
+                    let dir = path.parent().unwrap_or(Path::new("."));
+                    let file_prefix = path.file_name().unwrap_or_default();
+                    
+                    let (non_blocking, guard) = match rolling_policy {
+                        RollingPolicy::Hourly => {
+                            let appender = tracing_appender::rolling::hourly(dir, file_prefix);
+                            tracing_appender::non_blocking(appender)
+                        },
+                        RollingPolicy::Daily => {
+                            let appender = tracing_appender::rolling::daily(dir, file_prefix);
+                            tracing_appender::non_blocking(appender)
+                        },
+                        RollingPolicy::Never => {
+                            let appender = tracing_appender::rolling::never(dir, file_prefix);
+                            tracing_appender::non_blocking(appender)
+                        }
+                    };
+                    (Some(non_blocking), Some(guard))
+                }
             } else {
-                subscriber_builder.init();
+                (None, None)
+            };
+            
+            if layout_type == LayoutType::Json {
+                let subscriber_builder = tracing_subscriber::fmt().json().with_max_level(level);
+                if let Some(w) = writer {
+                    subscriber_builder.with_writer(w).init();
+                } else {
+                    subscriber_builder.init();
+                }
+            } else {
+                let subscriber_builder = tracing_subscriber::fmt().with_max_level(level);
+                if let Some(w) = writer {
+                    subscriber_builder.with_writer(w).init();
+                } else {
+                    subscriber_builder.init();
+                }
+            }
+            
+            if let Some(g) = guard {
+                Box::leak(Box::new(g));
             }
             
             while let Ok(event) = receiver.recv() {
-                // If context is present, append it to the message
-                let full_message = match event.context {
-                    Some(ctx) => format!("{} {}", event.message, ctx),
-                    None => event.message,
-                };
-
-                match event.level {
-                    1 => trace!("{}", full_message),
-                    2 => debug!("{}", full_message),
-                    3 => info!("{}", full_message),
-                    4 => warn!("{}", full_message),
-                    5 => error!("{}", full_message),
-                    _ => info!("{}", full_message),
+                match event.context {
+                    Some(ctx) => {
+                        match event.level {
+                            1 => trace!(context = %ctx, "{}", event.message),
+                            2 => debug!(context = %ctx, "{}", event.message),
+                            3 => info!(context = %ctx, "{}", event.message),
+                            4 => warn!(context = %ctx, "{}", event.message),
+                            5 => error!(context = %ctx, "{}", event.message),
+                            _ => info!(context = %ctx, "{}", event.message),
+                        }
+                    },
+                    None => {
+                        match event.level {
+                            1 => trace!("{}", event.message),
+                            2 => debug!("{}", event.message),
+                            3 => info!("{}", event.message),
+                            4 => warn!("{}", event.message),
+                            5 => error!("{}", event.message),
+                            _ => info!("{}", event.message),
+                        }
+                    }
                 }
             }
         });
@@ -161,6 +215,63 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                             config.file_name = Some(f_name);
                             config.rolling_policy = policy;
                         }
+                    } else if name_str.eq_ignore_ascii_case("JsonLayout") {
+                        println!("Rust detected JsonLayout");
+                        config.layout_type = LayoutType::Json;
+                    } else if name_str.eq_ignore_ascii_case("AsyncQueueFullPolicy") {
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.as_ref() == b"type" {
+                                    if let Ok(policy_type) = String::from_utf8(attr.value.into_owned()) {
+                                        if policy_type.eq_ignore_ascii_case("Block") {
+                                            println!("Rust configured to BLOCK on full queue");
+                                            QUEUE_POLICY.store(1, Ordering::SeqCst);
+                                        } else {
+                                            QUEUE_POLICY.store(0, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if name_str.eq_ignore_ascii_case("SizeBasedTriggeringPolicy") {
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.as_ref() == b"size" {
+                                    if let Ok(size_str) = String::from_utf8(attr.value.into_owned()) {
+                                        let size_str = size_str.to_uppercase();
+                                        let mut size: u64 = Default::default();
+                                        if size_str.ends_with("MB") {
+                                            if let Ok(val) = size_str.trim_end_matches("MB").trim().parse::<u64>() {
+                                                size = val * 1024 * 1024;
+                                            }
+                                        } else if size_str.ends_with("KB") {
+                                            if let Ok(val) = size_str.trim_end_matches("KB").trim().parse::<u64>() {
+                                                size = val * 1024;
+                                            }
+                                        } else {
+                                            if let Ok(val) = size_str.parse::<u64>() {
+                                                size = val;
+                                            }
+                                        }
+                                        println!("Rust configured SizeBasedTriggeringPolicy: {} bytes", size);
+                                        config.max_size = Some(size);
+                                    }
+                                }
+                            }
+                        }
+                    } else if name_str.eq_ignore_ascii_case("DefaultRolloverStrategy") {
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.as_ref() == b"max" {
+                                    if let Ok(max_str) = String::from_utf8(attr.value.into_owned()) {
+                                        if let Ok(max_val) = max_str.parse::<usize>() {
+                                            println!("Rust configured DefaultRolloverStrategy max: {}", max_val);
+                                            config.max_files = max_val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else if name_str.eq_ignore_ascii_case("Root") {
                         for attr in e.attributes() {
                             if let Ok(attr) = attr {
@@ -219,12 +330,28 @@ pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_
             }
         }
 
-        let _ = LOG_SENDER.try_send(LogEvent {
+        let event = LogEvent {
             level,
             message: str_slice.to_owned(),
             context,
-        });
+        };
+        
+        if QUEUE_POLICY.load(Ordering::Relaxed) == 1 {
+            let _ = LOG_SENDER.send(event);
+        } else {
+            let _ = LOG_SENDER.try_send(event);
+        }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rlog_flush() {
+    // Wait for the queue to empty
+    while !LOG_SENDER.is_empty() {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Give the tracing appender background thread a moment to flush to disk
+    thread::sleep(std::time::Duration::from_millis(100));
 }
 
 // --- JNI WRAPPERS FOR UNIVERSAL JAVA SUPPORT (Java 8+) ---
@@ -280,4 +407,12 @@ pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log
             rlog_log(level, msg_str.as_ptr());
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1flush(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    rlog_flush();
 }
