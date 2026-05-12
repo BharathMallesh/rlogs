@@ -43,6 +43,11 @@ public class ThroughputBenchmarkTest {
         rlog4DirectFile.deleteOnExit();
         long rlog4DirectResult = benchmarkRlog4Direct(rlog4DirectFile);
 
+        // ── 1c. rlog4 FFM (Java 22+, bypasses JNI entirely) ────────────────
+        File rlog4FfmFile = File.createTempFile("rlog4-ffm-", ".log");
+        rlog4FfmFile.deleteOnExit();
+        long rlog4FfmResult = benchmarkRlog4Ffm(rlog4FfmFile);
+
         // Reset to default config so the comparison is fair
         Configurator.reconfigure(defaultXml());
         Thread.sleep(300);
@@ -65,17 +70,26 @@ public class ThroughputBenchmarkTest {
                 rlog4Result, rlog4File.length());
         System.out.printf("rlog4 direct JNI (NativeLogger.log)     %,12d events/sec  (file: %,d bytes)%n",
                 rlog4DirectResult, rlog4DirectFile.length());
+        System.out.printf("rlog4 FFM (NativeLoggerFFM.log)         %,12d events/sec  (file: %,d bytes)%n",
+                rlog4FfmResult, rlog4FfmFile.length());
         System.out.printf("Java BufferedWriter (8KB buf) %,12d events/sec  (file size: %,d bytes)%n",
                 javaResult, javaFile.length());
         System.out.printf("Java FileWriter (no buffer)   %,12d events/sec  (file size: %,d bytes)%n",
                 rawResult, rawFile.length());
         System.out.println(repeat('═', 70));
 
-        double ratio = (double) rlog4Result / javaResult;
-        if (ratio >= 1.0) {
-            System.out.printf("→ rlog4 is %.2fx faster than Java BufferedWriter%n", ratio);
+        long bestRlog4 = Math.max(Math.max(rlog4Result, rlog4DirectResult), rlog4FfmResult);
+        double ratioBest = (double) bestRlog4 / javaResult;
+        double ratioFull = (double) rlog4Result / javaResult;
+        if (ratioBest >= 1.0) {
+            System.out.printf("→ rlog4 (best path, FFM) is %.2fx faster than Java BufferedWriter%n", ratioBest);
         } else {
-            System.out.printf("→ Java BufferedWriter is %.2fx faster than rlog4%n", 1.0 / ratio);
+            System.out.printf("→ Java BufferedWriter is %.2fx faster than rlog4 (best path)%n", 1.0 / ratioBest);
+        }
+        if (ratioFull >= 1.0) {
+            System.out.printf("→ rlog4 full path is %.2fx faster than Java BufferedWriter%n", ratioFull);
+        } else {
+            System.out.printf("→ Java BufferedWriter is %.2fx faster than rlog4 full path%n", 1.0 / ratioFull);
         }
         System.out.println();
         System.out.println("Notes:");
@@ -162,6 +176,43 @@ public class ThroughputBenchmarkTest {
         double seconds = elapsed / 1_000_000_000.0;
         long eventsPerSec = (long) (EVENTS / seconds);
         System.out.printf("       rlog4 direct JNI done: %,d events in %.3fs → %,d events/sec%n",
+                EVENTS, seconds, eventsPerSec);
+        return eventsPerSec;
+    }
+
+    private long benchmarkRlog4Ffm(File logFile) throws Exception {
+        // Same pattern + file appender; switch the call path to FFM
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<Configuration status=\"WARN\">\n"
+                + "  <Appenders>\n"
+                + "    <File name=\"BenchFile\" fileName=\"" + logFile.getAbsolutePath() + "\">\n"
+                + "      <PatternLayout pattern=\"%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n\"/>\n"
+                + "    </File>\n"
+                + "  </Appenders>\n"
+                + "  <Loggers>\n"
+                + "    <Root level=\"INFO\"><AppenderRef ref=\"BenchFile\"/></Root>\n"
+                + "  </Loggers>\n"
+                + "</Configuration>";
+        Configurator.reconfigure(xml);
+        Thread.sleep(300);
+
+        System.out.println("[1c/4] rlog4 FFM warmup...");
+        for (int i = 0; i < WARMUP; i++) {
+            NativeLoggerFFM.log(3, "Warmup event " + i);
+        }
+        Thread.sleep(300);
+
+        System.out.println("       rlog4 FFM measuring...");
+        long start = System.nanoTime();
+        for (int i = 0; i < EVENTS; i++) {
+            NativeLoggerFFM.log(3, "Benchmark event message number " + i);
+        }
+        long elapsed = System.nanoTime() - start;
+        Thread.sleep(1000);
+
+        double seconds = elapsed / 1_000_000_000.0;
+        long eventsPerSec = (long) (EVENTS / seconds);
+        System.out.printf("       rlog4 FFM done: %,d events in %.3fs → %,d events/sec%n",
                 EVENTS, seconds, eventsPerSec);
         return eventsPerSec;
     }

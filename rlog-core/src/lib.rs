@@ -1191,6 +1191,43 @@ pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_
     }
 }
 
+/// C-ABI counterpart to the JNI rlog_log_full — exposed for FFM callers.
+/// Takes plain C strings (use NULL for absent fields).
+#[no_mangle]
+pub extern "C" fn rlog_log_full(
+    level: i32,
+    message:     *const c_char,
+    mdc:         *const c_char,
+    ndc:         *const c_char,
+    logger_name: *const c_char,
+    thread_name: *const c_char,
+    exception:   *const c_char,
+) {
+    if message.is_null() { return; }
+    let msg = match unsafe { CStr::from_ptr(message) }.to_str() {
+        Ok(s) => s.to_owned(), Err(_) => return,
+    };
+    fn opt(ptr: *const c_char) -> Option<String> {
+        if ptr.is_null() { return None; }
+        unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+            .filter(|s| !s.is_empty()).map(str::to_owned)
+    }
+    send_event(LogEvent {
+        level, message: msg,
+        mdc:         opt(mdc),
+        ndc:         opt(ndc),
+        logger_name: opt(logger_name),
+        thread_name: opt(thread_name),
+        exception:   opt(exception),
+        timestamp:   Utc::now(),
+        marker:        None,
+        caller_class:  None,
+        caller_method: None,
+        caller_file:   None,
+        caller_line:   None,
+    });
+}
+
 #[no_mangle]
 pub extern "C" fn rlog_flush() {
     while !LOG_SENDER.is_empty() {

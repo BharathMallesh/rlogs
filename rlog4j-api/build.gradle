@@ -11,8 +11,10 @@ repositories {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    // FFM (java.lang.foreign) requires Java 22+. Keep this in sync with the
+    // toolchain used in CI (Java 23 on this workstation).
+    sourceCompatibility = JavaVersion.VERSION_22
+    targetCompatibility = JavaVersion.VERSION_22
 }
 
 dependencies {
@@ -24,6 +26,8 @@ dependencies {
 
 test {
     useJUnitPlatform()
+    // FFM marks downcall handles as "restricted" — silence the warning.
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
 }
 
 publishing {
