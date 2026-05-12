@@ -7,12 +7,15 @@ use std::sync::Mutex;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 
 // Queue backpressure policy: 0 = Discard, 1 = Block
 static QUEUE_POLICY: AtomicU8 = AtomicU8::new(0);
+
+// Set to true once rlog_init() has been called (background thread is running)
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, PartialEq)]
 enum RollingPolicy { Never, Hourly, Daily }
@@ -71,6 +74,11 @@ struct LogEvent {
     thread_name: Option<String>,
     exception: Option<String>,  // full stack trace from printStackTrace()
     timestamp: DateTime<Utc>,
+}
+
+enum ChannelMessage {
+    Log(LogEvent),
+    Reconfigure,
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -432,120 +440,137 @@ fn effective_logger_level(logger_name: &str, root_level: i32, loggers: &[PerLogg
 
 // ── Event channel & background I/O thread ────────────────────────────────────
 
+/// Build a file writer from the given config snapshot.
+fn build_file_writer(
+    file_name: &Option<String>,
+    rolling_policy: &RollingPolicy,
+    max_size: Option<u64>,
+    max_files: usize,
+) -> Option<Box<dyn Write + Send>> {
+    let f_name = file_name.as_deref()?;
+    let path = Path::new(f_name);
+    let dir  = path.parent().unwrap_or(Path::new("."));
+    if !dir.as_os_str().is_empty() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Some(limit) = max_size {
+        let cond = rolling_file::RollingConditionBasic::new().max_size(limit);
+        match rolling_file::RollingFileAppender::new(f_name, cond, max_files) {
+            Ok(a)  => Some(Box::new(a)),
+            Err(e) => { eprintln!("Rlog4 Error: {}", e); None }
+        }
+    } else {
+        let prefix = path.file_name().unwrap_or_default();
+        match rolling_policy {
+            RollingPolicy::Hourly =>
+                Some(Box::new(tracing_appender::rolling::hourly(dir, prefix))),
+            RollingPolicy::Daily =>
+                Some(Box::new(tracing_appender::rolling::daily(dir, prefix))),
+            RollingPolicy::Never =>
+                match std::fs::OpenOptions::new().create(true).append(true).open(f_name) {
+                    Ok(f)  => Some(Box::new(std::io::BufWriter::new(f))),
+                    Err(e) => { eprintln!("Rlog4 Error: cannot open {}: {}", f_name, e); None }
+                },
+        }
+    }
+}
+
 fn send_event(event: LogEvent) {
     if QUEUE_POLICY.load(Ordering::Relaxed) == 1 {
-        let _ = LOG_SENDER.send(event);
+        let _ = LOG_SENDER.send(ChannelMessage::Log(event));
     } else {
-        let _ = LOG_SENDER.try_send(event);
+        let _ = LOG_SENDER.try_send(ChannelMessage::Log(event));
     }
 }
 
 lazy_static! {
-    static ref LOG_SENDER: Sender<LogEvent> = {
-        // Snapshot config before moving into the background thread
-        let (file_name, rolling_policy, min_level, layout_type,
-             max_size, max_files, filters, pattern, console_enabled, logger_configs) = {
-            let cfg = CONFIG.lock().unwrap();
-            (
-                cfg.file_name.clone(),
-                cfg.rolling_policy.clone(),
-                cfg.min_level,
-                cfg.layout_type.clone(),
-                cfg.max_size,
-                cfg.max_files,
-                cfg.filters.clone(),
-                cfg.pattern.clone(),
-                cfg.console_enabled,
-                cfg.loggers.clone(),
-            )
-        };
-
-        let (sender, receiver) = bounded::<LogEvent>(1_000_000);
+    static ref LOG_SENDER: Sender<ChannelMessage> = {
+        let (sender, receiver) = bounded::<ChannelMessage>(1_000_000);
 
         thread::spawn(move || {
-            // Build the optional file writer
-            let mut file_writer: Option<Box<dyn Write + Send>> = None;
+            // Take initial config snapshot
+            let (mut file_name, mut rolling_policy, mut min_level, mut layout_type,
+                 mut max_size, mut max_files, mut filters, mut pattern,
+                 mut console_enabled, mut logger_configs) = {
+                let cfg = CONFIG.lock().unwrap();
+                (
+                    cfg.file_name.clone(),
+                    cfg.rolling_policy.clone(),
+                    cfg.min_level,
+                    cfg.layout_type.clone(),
+                    cfg.max_size,
+                    cfg.max_files,
+                    cfg.filters.clone(),
+                    cfg.pattern.clone(),
+                    cfg.console_enabled,
+                    cfg.loggers.clone(),
+                )
+            };
 
-            if let Some(ref f_name) = file_name {
-                let path = Path::new(f_name);
-                let dir  = path.parent().unwrap_or(Path::new("."));
-                if !dir.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
+            let mut file_writer: Option<Box<dyn Write + Send>> =
+                build_file_writer(&file_name, &rolling_policy, max_size, max_files);
+            let mut use_console = console_enabled || file_writer.is_none();
 
-                if let Some(limit) = max_size {
-                    // Size-based rolling
-                    let cond = rolling_file::RollingConditionBasic::new().max_size(limit);
-                    match rolling_file::RollingFileAppender::new(f_name, cond, max_files) {
-                        Ok(a)  => { file_writer = Some(Box::new(a)); }
-                        Err(e) => { eprintln!("Rlog4 Error: {}", e); }
+            while let Ok(msg) = receiver.recv() {
+                match msg {
+                    ChannelMessage::Reconfigure => {
+                        // Re-snapshot config and rebuild the file writer
+                        let cfg = CONFIG.lock().unwrap();
+                        file_name      = cfg.file_name.clone();
+                        rolling_policy = cfg.rolling_policy.clone();
+                        min_level      = cfg.min_level;
+                        layout_type    = cfg.layout_type.clone();
+                        max_size       = cfg.max_size;
+                        max_files      = cfg.max_files;
+                        filters        = cfg.filters.clone();
+                        pattern        = cfg.pattern.clone();
+                        console_enabled = cfg.console_enabled;
+                        logger_configs = cfg.loggers.clone();
+                        drop(cfg);
+
+                        file_writer = build_file_writer(&file_name, &rolling_policy, max_size, max_files);
+                        use_console = console_enabled || file_writer.is_none();
+                        println!("Rlog4: configuration reloaded (root_level={} pattern='{}')", min_level, pattern);
                     }
-                } else {
-                    // Time-based or fixed file
-                    let prefix = path.file_name().unwrap_or_default();
-                    match rolling_policy {
-                        RollingPolicy::Hourly => {
-                            file_writer = Some(Box::new(
-                                tracing_appender::rolling::hourly(dir, prefix)
-                            ));
-                        }
-                        RollingPolicy::Daily => {
-                            file_writer = Some(Box::new(
-                                tracing_appender::rolling::daily(dir, prefix)
-                            ));
-                        }
-                        RollingPolicy::Never => {
-                            match std::fs::OpenOptions::new()
-                                .create(true).append(true).open(f_name)
-                            {
-                                Ok(f)  => { file_writer = Some(Box::new(std::io::BufWriter::new(f))); }
-                                Err(e) => { eprintln!("Rlog4 Error: cannot open {}: {}", f_name, e); }
+                    ChannelMessage::Log(event) => {
+                        // Per-logger level gate
+                        let eff_level = effective_logger_level(
+                            event.logger_name.as_deref().unwrap_or(""),
+                            min_level,
+                            &logger_configs,
+                        );
+                        if event.level < eff_level { continue; }
+
+                        // Custom filters
+                        let mut denied = false;
+                        for filter in &filters {
+                            match filter {
+                                LogFilter::Threshold { min_level } => {
+                                    if event.level < *min_level { denied = true; break; }
+                                }
+                                LogFilter::Regex { pattern, deny_on_match } => {
+                                    let m = pattern.is_match(&event.message);
+                                    if (m && *deny_on_match) || (!m && !*deny_on_match) {
+                                        denied = true; break;
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-            }
+                        if denied { continue; }
 
-            // Write to console when explicitly configured OR when there is no file
-            let use_console = console_enabled || file_writer.is_none();
+                        let formatted = match layout_type {
+                            LayoutType::Json    => format_json(&event),
+                            LayoutType::Pattern => apply_pattern(&pattern, &event),
+                        };
+                        let bytes = formatted.as_bytes();
 
-            while let Ok(event) = receiver.recv() {
-                // Per-logger level gate (falls back to root min_level when no specific config matches)
-                let eff_level = effective_logger_level(
-                    event.logger_name.as_deref().unwrap_or(""),
-                    min_level,
-                    &logger_configs,
-                );
-                if event.level < eff_level { continue; }
-
-                // Custom filters
-                let mut denied = false;
-                for filter in &filters {
-                    match filter {
-                        LogFilter::Threshold { min_level } => {
-                            if event.level < *min_level { denied = true; break; }
+                        if use_console {
+                            let _ = std::io::stdout().write_all(bytes);
                         }
-                        LogFilter::Regex { pattern, deny_on_match } => {
-                            let m = pattern.is_match(&event.message);
-                            if (m && *deny_on_match) || (!m && !*deny_on_match) {
-                                denied = true; break;
-                            }
+                        if let Some(ref mut fw) = file_writer {
+                            let _ = fw.write_all(bytes);
                         }
                     }
-                }
-                if denied { continue; }
-
-                let formatted = match layout_type {
-                    LayoutType::Json    => format_json(&event),
-                    LayoutType::Pattern => apply_pattern(&pattern, &event),
-                };
-                let bytes = formatted.as_bytes();
-
-                if use_console {
-                    let _ = std::io::stdout().write_all(bytes);
-                }
-                if let Some(ref mut fw) = file_writer {
-                    let _ = fw.write_all(bytes);
                 }
             }
         });
@@ -762,14 +787,27 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
         }
         buf.clear();
     }
+
+    // If the background thread is already running, tell it to reload config
+    if INITIALIZED.load(Ordering::Relaxed) {
+        let _ = LOG_SENDER.try_send(ChannelMessage::Reconfigure);
+    }
     0
 }
 
 #[no_mangle]
 pub extern "C" fn rlog_init() -> i32 {
-    // Touch LOG_SENDER to force lazy initialisation with current CONFIG
+    // Force lazy initialisation of the background I/O thread
     let _ = LOG_SENDER.len();
+    INITIALIZED.store(true, Ordering::Relaxed);
     0
+}
+
+/// Runtime-only reconfigure entry point (alias for rlog_configure).
+/// Called by Configurator.reconfigure() and the file-watcher path.
+#[no_mangle]
+pub extern "C" fn rlog_reconfigure(xml_ptr: *const c_char) -> i32 {
+    rlog_configure(xml_ptr)
 }
 
 #[no_mangle]
@@ -889,6 +927,15 @@ pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log
         exception,
         timestamp: Utc::now(),
     });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1reconfigure(
+    mut env: JNIEnv, _class: JClass, xml_content: JString,
+) -> jint {
+    if let Ok(s) = env.get_string(&xml_content) {
+        rlog_reconfigure(s.as_ptr())
+    } else { -1 }
 }
 
 #[no_mangle]

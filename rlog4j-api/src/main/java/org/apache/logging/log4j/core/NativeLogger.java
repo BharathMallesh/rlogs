@@ -31,6 +31,9 @@ public class NativeLogger {
 
     private static native void rlog_flush();
 
+    /** Runtime reconfiguration — safe to call after rlog_init(). */
+    private static native int  rlog_reconfigure(String xmlContent);
+
     // ── Java-side level tracking for isEnabled() short-circuit ────────────
 
     private static volatile Level configuredLevel = Level.TRACE;
@@ -192,6 +195,93 @@ public class NativeLogger {
     }
 
     public static Level getConfiguredLevel() { return configuredLevel; }
+
+    // ── Runtime reconfiguration ────────────────────────────────────────────────
+
+    private static volatile Thread watcherThread = null;
+    private static volatile boolean watcherRunning = false;
+
+    /**
+     * Reload the native Rust logger from an XML string and update Java-side
+     * level maps immediately. Safe to call from any thread at any time.
+     */
+    public static void reconfigureFromXml(String xmlContent) {
+        if (xmlContent == null || xmlContent.isEmpty()) return;
+        String resolved = resolveLookups(xmlContent);
+        parseConfiguredLevel(resolved);
+        parseLoggerLevels(resolved);
+        try {
+            rlog_reconfigure(resolved);
+        } catch (Throwable t) {
+            System.err.println("Rlog4 Warning: rlog_reconfigure failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Reload from a file path. Reads the file content and delegates to
+     * {@link #reconfigureFromXml(String)}.
+     */
+    public static void reconfigureFromFile(String configFilePath) {
+        try {
+            String xml = new java.util.Scanner(
+                    new java.io.File(configFilePath), "UTF-8")
+                    .useDelimiter("\\A").next();
+            reconfigureFromXml(xml);
+            System.out.println("Rlog4: reloaded config from " + configFilePath);
+        } catch (Throwable t) {
+            System.err.println("Rlog4 Warning: cannot read config file " + configFilePath + ": " + t.getMessage());
+        }
+    }
+
+    /**
+     * Start a background thread that watches {@code configFilePath} for changes
+     * and calls {@link #reconfigureFromFile(String)} automatically.
+     * Only one watcher runs at a time; calling this again replaces the previous one.
+     */
+    public static synchronized void startFileWatcher(String configFilePath) {
+        stopFileWatcher();
+        watcherRunning = true;
+        watcherThread = new Thread(() -> {
+            try {
+                java.nio.file.Path path = java.nio.file.Paths.get(configFilePath);
+                java.nio.file.Path dir  = path.getParent();
+                if (dir == null) dir = java.nio.file.Paths.get(".");
+                try (java.nio.file.WatchService watcher =
+                         java.nio.file.FileSystems.getDefault().newWatchService()) {
+                    dir.register(watcher,
+                            java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY);
+                    System.out.println("Rlog4: watching " + configFilePath + " for changes");
+                    while (watcherRunning) {
+                        java.nio.file.WatchKey key = watcher.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (key == null) continue;
+                        for (java.nio.file.WatchEvent<?> event : key.pollEvents()) {
+                            Object ctx = event.context();
+                            if (ctx != null && ctx.toString().equals(path.getFileName().toString())) {
+                                Thread.sleep(100); // let the write finish
+                                reconfigureFromFile(configFilePath);
+                            }
+                        }
+                        if (!key.reset()) break;
+                    }
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                System.err.println("Rlog4 Warning: file watcher error: " + t.getMessage());
+            }
+        }, "rlog4-file-watcher");
+        watcherThread.setDaemon(true);
+        watcherThread.start();
+    }
+
+    /** Stop the file-watcher thread if it is running. */
+    public static synchronized void stopFileWatcher() {
+        watcherRunning = false;
+        if (watcherThread != null) {
+            watcherThread.interrupt();
+            watcherThread = null;
+        }
+    }
 
     // ── Public log API ─────────────────────────────────────────────────────
 
