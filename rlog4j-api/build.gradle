@@ -22,6 +22,9 @@ dependencies {
     implementation 'org.yaml:snakeyaml:2.2'
     testImplementation platform('org.junit:junit-bom:5.10.0')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    // Real Log4j2 — used only by the head-to-head benchmark
+    testImplementation 'org.apache.logging.log4j:log4j-core:2.20.0'
+    testImplementation 'com.lmax:disruptor:3.4.4'
 }
 
 test {
