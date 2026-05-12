@@ -56,7 +56,7 @@ lazy_static! {
         max_size: None,
         max_files: 7,
         filters: Vec::new(),
-        pattern: "%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n".to_string(),
+        pattern: "%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n%ex".to_string(),
         console_enabled: false,
         loggers: Vec::new(),
     });
@@ -65,9 +65,11 @@ lazy_static! {
 struct LogEvent {
     level: i32,
     message: String,
-    context: Option<String>,
+    mdc: Option<String>,        // MDC flat map  e.g. "{requestId=abc, userId=42}"
+    ndc: Option<String>,        // NDC stack     e.g. "outer inner"
     logger_name: Option<String>,
     thread_name: Option<String>,
+    exception: Option<String>,  // full stack trace from printStackTrace()
     timestamp: DateTime<Utc>,
 }
 
@@ -170,13 +172,14 @@ fn format_logger_name(name: &str, precision: Option<&str>) -> String {
     }
 }
 
-/// Extract MDC value(s) from context string of the form "{k1=v1, k2=v2}".
-fn format_mdc(context: Option<&str>, key: Option<&str>) -> String {
-    match (context, key) {
+/// Render MDC from a "{k1=v1, k2=v2}" string.
+/// With a key arg returns just that value; without returns the full map string.
+fn format_mdc(mdc: Option<&str>, key: Option<&str>) -> String {
+    match (mdc, key) {
         (None, _) | (Some(""), _) => String::new(),
-        (Some(ctx), None) => ctx.to_string(),
-        (Some(ctx), Some(k)) => {
-            let inner = ctx.trim_matches(|c| c == '{' || c == '}');
+        (Some(m), None) => m.to_string(),
+        (Some(m), Some(k)) => {
+            let inner = m.trim_matches(|c| c == '{' || c == '}');
             for pair in inner.split(", ") {
                 let mut kv = pair.splitn(2, '=');
                 if let (Some(pk), Some(pv)) = (kv.next(), kv.next()) {
@@ -184,6 +187,22 @@ fn format_mdc(context: Option<&str>, key: Option<&str>) -> String {
                 }
             }
             String::new()
+        }
+    }
+}
+
+/// Render NDC stack (space-separated values). Optional depth arg limits to last N items.
+fn format_ndc(ndc: Option<&str>, depth: Option<&str>) -> String {
+    match ndc {
+        None | Some("") => String::new(),
+        Some(s) => {
+            if let Some(d) = depth.and_then(|d| d.parse::<usize>().ok()) {
+                let parts: Vec<&str> = s.split(' ').collect();
+                if d >= parts.len() { return s.to_string(); }
+                parts[parts.len() - d..].join(" ")
+            } else {
+                s.to_string()
+            }
         }
     }
 }
@@ -279,11 +298,17 @@ fn apply_pattern(pattern: &str, event: &LogEvent) -> String {
 
             "n" => "\n".to_string(),
 
-            "X" | "mdc" | "MDC" | "x" =>
-                format_mdc(event.context.as_deref(), arg),
+            // %X or %X{key} — MDC flat map
+            "X" | "mdc" | "MDC" =>
+                format_mdc(event.mdc.as_deref(), arg),
 
-            // Exception is already appended to message on the Java side
-            "ex" | "exception" | "throwable" | "xEx" | "xThrowable" | "rEx" => String::new(),
+            // %x or %x{depth} — NDC stack
+            "x" | "ndc" | "NDC" =>
+                format_ndc(event.ndc.as_deref(), arg),
+
+            // %ex — full exception stack trace (empty string when no exception)
+            "ex" | "exception" | "throwable" | "xEx" | "xThrowable" | "rEx" =>
+                event.exception.clone().unwrap_or_default(),
 
             "r" | "relative" => "0".to_string(),
 
@@ -360,9 +385,19 @@ fn format_json(event: &LogEvent) -> String {
         msg = json_escape(&event.message),
     );
 
-    if let Some(ctx) = &event.context {
-        if !ctx.is_empty() {
-            json.push_str(&format!(",\"context\":\"{}\"", json_escape(ctx)));
+    if let Some(mdc) = &event.mdc {
+        if !mdc.is_empty() {
+            json.push_str(&format!(",\"mdc\":\"{}\"", json_escape(mdc)));
+        }
+    }
+    if let Some(ndc) = &event.ndc {
+        if !ndc.is_empty() {
+            json.push_str(&format!(",\"ndc\":\"{}\"", json_escape(ndc)));
+        }
+    }
+    if let Some(ex) = &event.exception {
+        if !ex.is_empty() {
+            json.push_str(&format!(",\"exception\":\"{}\"", json_escape(ex)));
         }
     }
     json.push_str("}\n");
@@ -747,15 +782,17 @@ pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_
     if msg_ptr.is_null() { return; }
     let c_str = unsafe { CStr::from_ptr(msg_ptr) };
     if let Ok(msg) = c_str.to_str() {
-        let context = if ctx_ptr.is_null() { None } else {
+        let mdc = if ctx_ptr.is_null() { None } else {
             unsafe { CStr::from_ptr(ctx_ptr) }.to_str().ok().map(str::to_owned)
         };
         send_event(LogEvent {
             level,
             message: msg.to_owned(),
-            context,
+            mdc,
+            ndc: None,
             logger_name: None,
             thread_name: None,
+            exception: None,
             timestamp: Utc::now(),
         });
     }
@@ -819,31 +856,37 @@ pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log
     }
 }
 
-/// Full-featured log call: carries logger name and thread name across JNI so
-/// PatternLayout specifiers %logger and %thread work correctly.
+/// Full-featured log call: carries logger name, thread name, MDC, NDC, and
+/// exception stack trace across JNI so all PatternLayout specifiers work.
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log_1full(
     mut env: JNIEnv, _class: JClass,
     level: jint,
     message: JString,
-    context: JString,
+    mdc: JString,
+    ndc: JString,
     logger_name: JString,
     thread_name: JString,
+    exception: JString,
 ) {
     let msg = match env.get_string(&message) {
         Ok(s) => String::from(s),
         Err(_) => return,
     };
-    let context     = jstring_to_opt(&mut env, &context);
+    let mdc         = jstring_to_opt(&mut env, &mdc);
+    let ndc         = jstring_to_opt(&mut env, &ndc);
     let logger_name = jstring_to_opt(&mut env, &logger_name);
     let thread_name = jstring_to_opt(&mut env, &thread_name);
+    let exception   = jstring_to_opt(&mut env, &exception);
 
     send_event(LogEvent {
         level,
         message: msg,
-        context,
+        mdc,
+        ndc,
         logger_name,
         thread_name,
+        exception,
         timestamp: Utc::now(),
     });
 }

@@ -2,11 +2,11 @@
 <Configuration status="WARN">
     <Appenders>
         <Console name="Console" target="SYSTEM_OUT">
-            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n%ex"/>
         </Console>
         <RollingFile name="File" fileName="target/rust-rolling-app.log"
                      filePattern="target/rust-rolling-app-%d{yyyy-MM-dd}.log">
-            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss} [%t] %-5level %logger{36} - %msg%n"/>
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss} [%t] %-5level %logger{36} - %msg%n%ex"/>
             <Policies>
                 <TimeBasedTriggeringPolicy />
             </Policies>

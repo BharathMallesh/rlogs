@@ -63,36 +63,43 @@ public class RlogLogger extends AbstractLogger {
 
     @Override
     public void logMessage(String fqcn, Level level, Marker marker, Message message, Throwable t) {
-        int rustLevel = 3; // Default INFO
+        int rustLevel = 3;
         if (level == Level.TRACE) rustLevel = 1;
         else if (level == Level.DEBUG) rustLevel = 2;
         else if (level == Level.INFO) rustLevel = 3;
         else if (level == Level.WARN) rustLevel = 4;
         else if (level == Level.ERROR || level == Level.FATAL) rustLevel = 5;
 
+        // Clean message — no exception appended; %ex in the pattern handles that
         String formattedMsg = message.getFormattedMessage();
+
+        // Full exception stack trace via %ex
+        String exceptionStr = null;
         if (t != null) {
-            formattedMsg += " | Exception: " + t.toString();
+            java.io.StringWriter sw = new java.io.StringWriter(512);
+            t.printStackTrace(new java.io.PrintWriter(sw));
+            exceptionStr = sw.toString();
         }
-        
-        // Extract MDC context
+
+        // MDC flat map
         java.util.Map<String, String> contextMap = org.apache.logging.log4j.ThreadContext.getContext();
         StringBuilder ctxBuilder = new StringBuilder();
-
-        // Prepend marker if present
         if (marker != null) {
             ctxBuilder.append("marker=").append(marker.getName());
         }
-
-        // Append MDC entries
         if (contextMap != null && !contextMap.isEmpty()) {
             if (ctxBuilder.length() > 0) ctxBuilder.append(", ");
-            ctxBuilder.append(contextMap.toString(), 1, contextMap.toString().length() - 1); // strip { }
+            String mapStr = contextMap.toString();
+            ctxBuilder.append(mapStr, 1, mapStr.length() - 1); // strip { }
         }
+        String mdcString = ctxBuilder.length() > 0 ? "{" + ctxBuilder + "}" : null;
 
-        String mdcString = ctxBuilder.length() > 0 ? "{" + ctxBuilder.toString() + "}" : null;
-        
-        NativeLogger.log(rustLevel, formattedMsg, mdcString,
-                getName(), Thread.currentThread().getName());
+        // NDC stack (space-separated; rendered by %x in pattern)
+        java.util.List<String> ndcStack =
+            org.apache.logging.log4j.ThreadContext.getImmutableStack().asList();
+        String ndcString = ndcStack.isEmpty() ? null : String.join(" ", ndcStack);
+
+        NativeLogger.log(rustLevel, formattedMsg, mdcString, ndcString,
+                getName(), Thread.currentThread().getName(), exceptionStr);
     }
 }

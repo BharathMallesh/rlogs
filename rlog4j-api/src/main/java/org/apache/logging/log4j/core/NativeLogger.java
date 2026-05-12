@@ -18,11 +18,16 @@ public class NativeLogger {
     private static native void rlog_log(int level, String message);
     private static native void rlog_log_with_context(int level, String message, String context);
 
-    /** Full call: carries logger name + thread name so %logger / %thread patterns work. */
+    /**
+     * Full call: carries MDC, NDC, logger name, thread name, and exception
+     * stack trace so all PatternLayout specifiers work correctly.
+     */
     private static native void rlog_log_full(int level, String message,
-                                             String context,
+                                             String mdc,
+                                             String ndc,
                                              String loggerName,
-                                             String threadName);
+                                             String threadName,
+                                             String exception);
 
     private static native void rlog_flush();
 
@@ -190,30 +195,40 @@ public class NativeLogger {
 
     // ── Public log API ─────────────────────────────────────────────────────
 
-    /** Convenience — no MDC, no logger/thread metadata. */
+    /** Convenience — no metadata (used by tests and benchmark). */
     public static void log(int level, String message) {
-        log(level, message, null, null, null);
+        log(level, message, null, null, null, null, null);
     }
 
-    /** Convenience — MDC only (used by benchmark). */
+    /** Convenience — MDC only. */
     public static void log(int level, String message, String mdcString) {
-        log(level, message, mdcString, null, null);
+        log(level, message, mdcString, null, null, null, null);
+    }
+
+    /** Convenience — MDC + logger/thread names, no NDC, no exception. */
+    public static void log(int level, String message,
+                           String mdcString, String loggerName, String threadName) {
+        log(level, message, mdcString, null, loggerName, threadName, null);
     }
 
     /**
      * Full call used by {@link RlogLogger}.
-     * Passes logger name and thread name so %logger / %thread / %t patterns
-     * in PatternLayout produce correct output.
+     * Passes MDC, NDC, logger name, thread name, and exception stack trace so
+     * all PatternLayout specifiers (%X, %x, %logger, %t, %ex) work correctly.
      */
     public static void log(int level, String message,
-                           String mdcString, String loggerName, String threadName) {
+                           String mdcString, String ndcString,
+                           String loggerName, String threadName,
+                           String exception) {
         try {
             rlog_log_full(
                 level,
                 message,
-                mdcString    != null ? mdcString    : "",
-                loggerName   != null ? loggerName   : "",
-                threadName   != null ? threadName   : Thread.currentThread().getName()
+                mdcString  != null ? mdcString  : "",
+                ndcString  != null ? ndcString  : "",
+                loggerName != null ? loggerName : "",
+                threadName != null ? threadName : Thread.currentThread().getName(),
+                exception  != null ? exception  : ""
             );
         } catch (Throwable t) {
             System.err.println("Rlog4 Native Log Failure: " + message);
