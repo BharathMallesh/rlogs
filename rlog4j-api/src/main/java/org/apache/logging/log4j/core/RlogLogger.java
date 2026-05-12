@@ -96,29 +96,31 @@ public class RlogLogger extends AbstractLogger {
         // Feature 9: Marker name
         String markerName = (marker != null) ? marker.getName() : null;
 
-        // Feature 8: Caller location.
-        // Match only the specific bridge classes (not the entire package) so that
-        // application code that happens to live in org.apache.logging.* is not skipped.
+        // Feature 8: Caller location — skip the expensive stack walk unless the
+        // active pattern actually uses %C / %M / %L / %F.
+        // Thread.getStackTrace() costs ~20µs per call which dominates throughput.
         String callerClass = null, callerMethod = null, callerFile = null, callerLine = null;
-        try {
-            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-            int lastFwFrame = -1;
-            for (int j = 0; j < stack.length; j++) {
-                String cls = stack[j].getClassName();
-                if (cls.equals("java.lang.Thread")
-                        || cls.equals("org.apache.logging.log4j.spi.AbstractLogger")
-                        || cls.equals(RlogLogger.class.getName())) {
-                    lastFwFrame = j;
+        if (NativeLogger.LOCATION_REQUIRED) {
+            try {
+                StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+                int lastFwFrame = -1;
+                for (int j = 0; j < stack.length; j++) {
+                    String cls = stack[j].getClassName();
+                    if (cls.equals("java.lang.Thread")
+                            || cls.equals("org.apache.logging.log4j.spi.AbstractLogger")
+                            || cls.equals(RlogLogger.class.getName())) {
+                        lastFwFrame = j;
+                    }
                 }
-            }
-            if (lastFwFrame >= 0 && lastFwFrame + 1 < stack.length) {
-                StackTraceElement f = stack[lastFwFrame + 1];
-                callerClass  = f.getClassName();
-                callerMethod = f.getMethodName();
-                callerFile   = f.getFileName() != null ? f.getFileName() : "?";
-                callerLine   = String.valueOf(f.getLineNumber());
-            }
-        } catch (Exception ignored) {}
+                if (lastFwFrame >= 0 && lastFwFrame + 1 < stack.length) {
+                    StackTraceElement f = stack[lastFwFrame + 1];
+                    callerClass  = f.getClassName();
+                    callerMethod = f.getMethodName();
+                    callerFile   = f.getFileName() != null ? f.getFileName() : "?";
+                    callerLine   = String.valueOf(f.getLineNumber());
+                }
+            } catch (Exception ignored) {}
+        }
 
         NativeLogger.log(rustLevel, formattedMsg, mdcString, ndcString,
                 getName(), Thread.currentThread().getName(), exceptionStr,

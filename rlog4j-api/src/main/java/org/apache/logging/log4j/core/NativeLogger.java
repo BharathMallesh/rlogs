@@ -67,6 +67,18 @@ public class NativeLogger {
     private static final Pattern ATTR_LEVEL_PATTERN =
         Pattern.compile("\\blevel=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
 
+    private static final Pattern PATTERNLAYOUT_PATTERN =
+        Pattern.compile("<PatternLayout[^/>]*pattern=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern LOCATION_SPEC_PATTERN =
+        Pattern.compile("%[^%]{0,4}([CMLF]|class|method|line|file)\\b");
+
+    /**
+     * True iff any PatternLayout in the current config uses %C / %M / %L / %F.
+     * RlogLogger checks this before doing the expensive stack walk so the
+     * caller-location capture cost is paid only when the pattern needs it.
+     */
+    static volatile boolean LOCATION_REQUIRED = false;
+
     // ── Static initialiser ─────────────────────────────────────────────────
 
     static {
@@ -109,6 +121,7 @@ public class NativeLogger {
                 xmlContent = resolveLookups(xmlContent);
                 parseConfiguredLevel(xmlContent);
                 parseLoggerLevels(xmlContent);
+                parseLocationRequired(xmlContent);
                 System.out.println("Rlog4 Config XML:\n" + xmlContent);
                 rlog_configure(xmlContent);
             }
@@ -178,6 +191,18 @@ public class NativeLogger {
         }
     }
 
+    private static void parseLocationRequired(String xml) {
+        Matcher m = PATTERNLAYOUT_PATTERN.matcher(xml);
+        boolean needed = false;
+        while (m.find()) {
+            if (LOCATION_SPEC_PATTERN.matcher(m.group(1)).find()) {
+                needed = true;
+                break;
+            }
+        }
+        LOCATION_REQUIRED = needed;
+    }
+
     /** Parse all &lt;Logger name="..." level="..."/&gt; entries into LOGGER_LEVEL_MAP. */
     static void parseLoggerLevels(String xml) {
         LOGGER_LEVEL_MAP.clear();
@@ -241,6 +266,7 @@ public class NativeLogger {
         String resolved = resolveLookups(xmlContent);
         parseConfiguredLevel(resolved);
         parseLoggerLevels(resolved);
+        parseLocationRequired(resolved);
         try {
             rlog_reconfigure(resolved);
         } catch (Throwable t) {
