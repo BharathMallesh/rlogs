@@ -2,309 +2,737 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use crossbeam_channel::{bounded, Sender};
 use lazy_static::lazy_static;
-use tracing::{error, info, debug, trace, warn};
 use std::thread;
 use std::sync::Mutex;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
+use chrono::{DateTime, Utc};
+use std::io::Write;
 
-// Global lock-free queue policy: 0 = Discard, 1 = Block
+// Queue backpressure policy: 0 = Discard, 1 = Block
 static QUEUE_POLICY: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, PartialEq)]
-enum RollingPolicy {
-    Never,
-    Hourly,
-    Daily,
-}
+enum RollingPolicy { Never, Hourly, Daily }
 
 #[derive(Clone, PartialEq)]
-enum LayoutType {
-    Pattern,
-    Json,
+enum LayoutType { Pattern, Json }
+
+#[derive(Clone)]
+enum LogFilter {
+    Threshold { min_level: i32 },
+    Regex { pattern: regex::Regex, deny_on_match: bool },
 }
 
-// Configuration state
+/// Per-logger configuration entry (mirrors <Logger name="..." level="..." additivity="..."/>)
+#[derive(Clone)]
+struct PerLoggerConfig {
+    name: String,
+    min_level: i32,
+    additivity: bool,
+}
+
 struct RlogConfig {
     file_name: Option<String>,
     rolling_policy: RollingPolicy,
-    level: tracing::Level,
+    min_level: i32,       // root level: 1=TRACE 2=DEBUG 3=INFO 4=WARN 5=ERROR
     layout_type: LayoutType,
     max_size: Option<u64>,
     max_files: usize,
+    filters: Vec<LogFilter>,
+    pattern: String,
+    console_enabled: bool,
+    loggers: Vec<PerLoggerConfig>,
 }
 
 lazy_static! {
     static ref CONFIG: Mutex<RlogConfig> = Mutex::new(RlogConfig {
         file_name: None,
         rolling_policy: RollingPolicy::Never,
-        level: tracing::Level::TRACE,
+        min_level: 1,
         layout_type: LayoutType::Pattern,
         max_size: None,
         max_files: 7,
+        filters: Vec::new(),
+        pattern: "%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n".to_string(),
+        console_enabled: false,
+        loggers: Vec::new(),
     });
 }
 
-// Define a log event struct
 struct LogEvent {
     level: i32,
     message: String,
     context: Option<String>,
+    logger_name: Option<String>,
+    thread_name: Option<String>,
+    timestamp: DateTime<Utc>,
+}
+
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+fn level_name(level: i32) -> &'static str {
+    match level {
+        1 => "TRACE",
+        2 => "DEBUG",
+        3 => "INFO",
+        4 => "WARN",
+        _ => "ERROR",
+    }
+}
+
+/// Convert a Java SimpleDateFormat pattern to a formatted timestamp string.
+/// Handles the most common tokens: y M d H h m s S E a z Z X plus quoted literals.
+fn format_timestamp(ts: &DateTime<Utc>, java_format: &str) -> String {
+    if java_format.is_empty() || java_format == "ISO8601" || java_format == "DEFAULT" {
+        return ts.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    }
+    let millis = ts.timestamp_subsec_millis();
+    let mut result = String::with_capacity(java_format.len() + 10);
+    let chars: Vec<char> = java_format.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        // Quoted literal: 'T' or 'text'
+        if chars[i] == '\'' {
+            i += 1;
+            while i < n && chars[i] != '\'' {
+                result.push(chars[i]);
+                i += 1;
+            }
+            if i < n { i += 1; }
+            continue;
+        }
+
+        let ch = chars[i];
+        if !ch.is_ascii_alphabetic() {
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // Count consecutive identical characters (e.g. "MM" vs "m")
+        let mut count = 0usize;
+        while i + count < n && chars[i + count] == ch { count += 1; }
+        i += count;
+
+        let segment = match ch {
+            'y' => ts.format("%Y").to_string(),
+            'M' => if count >= 3 { ts.format("%b").to_string() }
+                   else { ts.format("%m").to_string() },
+            'd' => ts.format("%d").to_string(),
+            'H' => ts.format("%H").to_string(),
+            'h' => ts.format("%I").to_string(),
+            'm' => ts.format("%M").to_string(),   // minute (lowercase m)
+            's' => ts.format("%S").to_string(),
+            'S' => {
+                let s = format!("{:03}", millis);
+                s[..count.min(3)].to_string()
+            },
+            'a' => ts.format("%p").to_string(),
+            'E' => if count >= 4 { ts.format("%A").to_string() }
+                   else { ts.format("%a").to_string() },
+            'z' | 'Z' | 'X' => ts.format("%z").to_string(),
+            _ => std::iter::repeat(ch).take(count).collect(),
+        };
+        result.push_str(&segment);
+    }
+    result
+}
+
+/// Abbreviate a fully-qualified class name to at most `max_len` characters,
+/// shortening package segments from the left (same behaviour as Log4j2).
+fn format_logger_name(name: &str, precision: Option<&str>) -> String {
+    let prec = match precision {
+        None => return name.to_string(),
+        Some(p) => p,
+    };
+    if let Ok(max_len) = prec.parse::<usize>() {
+        if name.len() <= max_len { return name.to_string(); }
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() <= 1 { return name.to_string(); }
+        let class = parts[parts.len() - 1];
+        let mut abbrev = String::new();
+        for (idx, part) in parts.iter().enumerate() {
+            if !abbrev.is_empty() { abbrev.push('.'); }
+            if idx == parts.len() - 1 {
+                abbrev.push_str(part);
+            } else {
+                abbrev.push(part.chars().next().unwrap_or('?'));
+            }
+        }
+        if abbrev.len() <= max_len { abbrev } else { class.to_string() }
+    } else {
+        name.to_string()
+    }
+}
+
+/// Extract MDC value(s) from context string of the form "{k1=v1, k2=v2}".
+fn format_mdc(context: Option<&str>, key: Option<&str>) -> String {
+    match (context, key) {
+        (None, _) | (Some(""), _) => String::new(),
+        (Some(ctx), None) => ctx.to_string(),
+        (Some(ctx), Some(k)) => {
+            let inner = ctx.trim_matches(|c| c == '{' || c == '}');
+            for pair in inner.split(", ") {
+                let mut kv = pair.splitn(2, '=');
+                if let (Some(pk), Some(pv)) = (kv.next(), kv.next()) {
+                    if pk.trim() == k { return pv.trim().to_string(); }
+                }
+            }
+            String::new()
+        }
+    }
+}
+
+/// Apply a Log4j2-style PatternLayout pattern to a log event.
+///
+/// Supported specifiers:
+///   %d{fmt}   timestamp          %t / %thread   thread name
+///   %p / %level / %le  level     %c / %logger{N}  logger name
+///   %m / %msg  message           %n  newline
+///   %X / %X{key}  MDC           %highlight{pat}  ANSI colour
+///   %%  literal percent          %-Np  left-justified with min width N
+///   %N.Mp  min width N, max (truncate) width M
+fn apply_pattern(pattern: &str, event: &LogEvent) -> String {
+    let mut result = String::with_capacity(256);
+    let bytes = pattern.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'%' {
+            result.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= len { break; }
+
+        // %% → literal %
+        if bytes[i] == b'%' {
+            result.push('%');
+            i += 1;
+            continue;
+        }
+
+        // Optional left-justify flag
+        let left_justify = if i < len && bytes[i] == b'-' { i += 1; true } else { false };
+
+        // Min width
+        let mut min_width = 0usize;
+        while i < len && bytes[i].is_ascii_digit() {
+            min_width = min_width * 10 + (bytes[i] - b'0') as usize;
+            i += 1;
+        }
+
+        // Max width: .N
+        let mut max_width: Option<usize> = None;
+        if i < len && bytes[i] == b'.' {
+            i += 1;
+            let mut mw = 0usize;
+            while i < len && bytes[i].is_ascii_digit() {
+                mw = mw * 10 + (bytes[i] - b'0') as usize;
+                i += 1;
+            }
+            if mw > 0 { max_width = Some(mw); }
+        }
+
+        // Specifier keyword (alphabetic)
+        let spec_start = i;
+        while i < len && bytes[i].is_ascii_alphabetic() { i += 1; }
+        let specifier = &pattern[spec_start..i];
+
+        // Optional {arg}  — handles nested braces (e.g. %highlight{%p})
+        let mut arg: Option<&str> = None;
+        if i < len && bytes[i] == b'{' {
+            i += 1;
+            let arg_start = i;
+            let mut depth = 1usize;
+            while i < len {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => { depth -= 1; if depth == 0 { break; } }
+                    _ => {}
+                }
+                i += 1;
+            }
+            arg = Some(&pattern[arg_start..i]);
+            if i < len { i += 1; }
+        }
+
+        let mut value = match specifier {
+            "d" | "date" => format_timestamp(&event.timestamp, arg.unwrap_or("")),
+
+            "t" | "thread" | "tn" | "threadName" =>
+                event.thread_name.clone().unwrap_or_else(|| "main".to_string()),
+
+            "p" | "level" | "le" => level_name(event.level).to_string(),
+
+            "c" | "logger" | "lo" =>
+                format_logger_name(event.logger_name.as_deref().unwrap_or("root"), arg),
+
+            "m" | "msg" | "message" => event.message.clone(),
+
+            "n" => "\n".to_string(),
+
+            "X" | "mdc" | "MDC" | "x" =>
+                format_mdc(event.context.as_deref(), arg),
+
+            // Exception is already appended to message on the Java side
+            "ex" | "exception" | "throwable" | "xEx" | "xThrowable" | "rEx" => String::new(),
+
+            "r" | "relative" => "0".to_string(),
+
+            "highlight" => {
+                let inner = if let Some(pat) = arg { apply_pattern(pat, event) }
+                            else { level_name(event.level).to_string() };
+                let color = match event.level {
+                    1 => "\x1b[37m",   // TRACE  white
+                    2 => "\x1b[34m",   // DEBUG  blue
+                    3 => "\x1b[32m",   // INFO   green
+                    4 => "\x1b[33m",   // WARN   yellow
+                    _ => "\x1b[31m",   // ERROR  red
+                };
+                format!("{}{}\x1b[0m", color, inner)
+            },
+
+            _ => {
+                let a = arg.map(|a| format!("{{{}}}", a)).unwrap_or_default();
+                format!("%{}{}", specifier, a)
+            }
+        };
+
+        // Truncate from left to max_width
+        if let Some(max) = max_width {
+            if value.len() > max {
+                let start = value.len() - max;
+                value = value[start..].to_string();
+            }
+        }
+
+        // Pad to min_width
+        if min_width > 0 && value.len() < min_width {
+            value = if left_justify {
+                format!("{:<w$}", value, w = min_width)
+            } else {
+                format!("{:>w$}", value, w = min_width)
+            };
+        }
+
+        result.push_str(&value);
+    }
+    result
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 32 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c    => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_json(event: &LogEvent) -> String {
+    let ts     = event.timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let level  = level_name(event.level);
+    let logger = event.logger_name.as_deref().unwrap_or("root");
+    let thread = event.thread_name.as_deref().unwrap_or("main");
+
+    let mut json = format!(
+        "{{\"timestamp\":\"{ts}\",\"level\":\"{level}\",\
+          \"logger\":\"{logger}\",\"thread\":\"{thread}\",\
+          \"message\":\"{msg}\"",
+        ts = ts, level = level,
+        logger = json_escape(logger),
+        thread = json_escape(thread),
+        msg = json_escape(&event.message),
+    );
+
+    if let Some(ctx) = &event.context {
+        if !ctx.is_empty() {
+            json.push_str(&format!(",\"context\":\"{}\"", json_escape(ctx)));
+        }
+    }
+    json.push_str("}\n");
+    json
+}
+
+// ── Per-logger level hierarchy ────────────────────────────────────────────────
+
+/// Walk the dotted logger name from most-specific to least-specific.
+/// Returns the first matching PerLoggerConfig's level, or root_level if none match.
+fn effective_logger_level(logger_name: &str, root_level: i32, loggers: &[PerLoggerConfig]) -> i32 {
+    if loggers.is_empty() || logger_name.is_empty() {
+        return root_level;
+    }
+    // Find the longest (most-specific) config name that is an exact match or
+    // a prefix of logger_name followed by a dot.
+    let mut best: Option<(&PerLoggerConfig, usize)> = None;
+    for cfg in loggers {
+        let is_match = logger_name == cfg.name
+            || logger_name.starts_with(&format!("{}.", cfg.name));
+        if is_match {
+            let spec = cfg.name.len();
+            match best {
+                None => best = Some((cfg, spec)),
+                Some((_, prev)) if spec > prev => best = Some((cfg, spec)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(cfg, _)| cfg.min_level).unwrap_or(root_level)
+}
+
+// ── Event channel & background I/O thread ────────────────────────────────────
+
+fn send_event(event: LogEvent) {
+    if QUEUE_POLICY.load(Ordering::Relaxed) == 1 {
+        let _ = LOG_SENDER.send(event);
+    } else {
+        let _ = LOG_SENDER.try_send(event);
+    }
 }
 
 lazy_static! {
     static ref LOG_SENDER: Sender<LogEvent> = {
-        let (sender, receiver) = bounded::<LogEvent>(1_000_000);
-        
-        // Read configuration and extract values to move into the thread
-        let (file_name, level, rolling_policy, layout_type, max_size, max_files) = {
-            let config = CONFIG.lock().unwrap();
-            (config.file_name.clone(), config.level, config.rolling_policy.clone(), config.layout_type.clone(), config.max_size, config.max_files)
+        // Snapshot config before moving into the background thread
+        let (file_name, rolling_policy, min_level, layout_type,
+             max_size, max_files, filters, pattern, console_enabled, logger_configs) = {
+            let cfg = CONFIG.lock().unwrap();
+            (
+                cfg.file_name.clone(),
+                cfg.rolling_policy.clone(),
+                cfg.min_level,
+                cfg.layout_type.clone(),
+                cfg.max_size,
+                cfg.max_files,
+                cfg.filters.clone(),
+                cfg.pattern.clone(),
+                cfg.console_enabled,
+                cfg.loggers.clone(),
+            )
         };
-        
+
+        let (sender, receiver) = bounded::<LogEvent>(1_000_000);
+
         thread::spawn(move || {
-            // Helper to get non_blocking writer
-            let (writer, guard) = if let Some(ref f_name) = file_name {
-                // Ensure parent directory exists
+            // Build the optional file writer
+            let mut file_writer: Option<Box<dyn Write + Send>> = None;
+
+            if let Some(ref f_name) = file_name {
                 let path = Path::new(f_name);
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
+                let dir  = path.parent().unwrap_or(Path::new("."));
+                if !dir.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(dir);
                 }
-                
+
                 if let Some(limit) = max_size {
-                    let condition = rolling_file::RollingConditionBasic::new().max_size(limit);
-                    let appender = rolling_file::RollingFileAppender::new(f_name, condition, max_files).unwrap();
-                    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-                    (Some(non_blocking), Some(guard))
+                    // Size-based rolling
+                    let cond = rolling_file::RollingConditionBasic::new().max_size(limit);
+                    match rolling_file::RollingFileAppender::new(f_name, cond, max_files) {
+                        Ok(a)  => { file_writer = Some(Box::new(a)); }
+                        Err(e) => { eprintln!("Rlog4 Error: {}", e); }
+                    }
                 } else {
-                    let path = Path::new(f_name);
-                    let dir = path.parent().unwrap_or(Path::new("."));
-                    let file_prefix = path.file_name().unwrap_or_default();
-                    
-                    let (non_blocking, guard) = match rolling_policy {
+                    // Time-based or fixed file
+                    let prefix = path.file_name().unwrap_or_default();
+                    match rolling_policy {
                         RollingPolicy::Hourly => {
-                            let appender = tracing_appender::rolling::hourly(dir, file_prefix);
-                            tracing_appender::non_blocking(appender)
-                        },
+                            file_writer = Some(Box::new(
+                                tracing_appender::rolling::hourly(dir, prefix)
+                            ));
+                        }
                         RollingPolicy::Daily => {
-                            let appender = tracing_appender::rolling::daily(dir, file_prefix);
-                            tracing_appender::non_blocking(appender)
-                        },
+                            file_writer = Some(Box::new(
+                                tracing_appender::rolling::daily(dir, prefix)
+                            ));
+                        }
                         RollingPolicy::Never => {
-                            let appender = tracing_appender::rolling::never(dir, file_prefix);
-                            tracing_appender::non_blocking(appender)
-                        }
-                    };
-                    (Some(non_blocking), Some(guard))
-                }
-            } else {
-                (None, None)
-            };
-            
-            if layout_type == LayoutType::Json {
-                let subscriber_builder = tracing_subscriber::fmt().json().with_max_level(level);
-                if let Some(w) = writer {
-                    subscriber_builder.with_writer(w).init();
-                } else {
-                    subscriber_builder.init();
-                }
-            } else {
-                let subscriber_builder = tracing_subscriber::fmt().with_max_level(level);
-                if let Some(w) = writer {
-                    subscriber_builder.with_writer(w).init();
-                } else {
-                    subscriber_builder.init();
-                }
-            }
-            
-            if let Some(g) = guard {
-                Box::leak(Box::new(g));
-            }
-            
-            while let Ok(event) = receiver.recv() {
-                match event.context {
-                    Some(ctx) => {
-                        match event.level {
-                            1 => trace!(context = %ctx, "{}", event.message),
-                            2 => debug!(context = %ctx, "{}", event.message),
-                            3 => info!(context = %ctx, "{}", event.message),
-                            4 => warn!(context = %ctx, "{}", event.message),
-                            5 => error!(context = %ctx, "{}", event.message),
-                            _ => info!(context = %ctx, "{}", event.message),
-                        }
-                    },
-                    None => {
-                        match event.level {
-                            1 => trace!("{}", event.message),
-                            2 => debug!("{}", event.message),
-                            3 => info!("{}", event.message),
-                            4 => warn!("{}", event.message),
-                            5 => error!("{}", event.message),
-                            _ => info!("{}", event.message),
+                            match std::fs::OpenOptions::new()
+                                .create(true).append(true).open(f_name)
+                            {
+                                Ok(f)  => { file_writer = Some(Box::new(std::io::BufWriter::new(f))); }
+                                Err(e) => { eprintln!("Rlog4 Error: cannot open {}: {}", f_name, e); }
+                            }
                         }
                     }
+                }
+            }
+
+            // Write to console when explicitly configured OR when there is no file
+            let use_console = console_enabled || file_writer.is_none();
+
+            while let Ok(event) = receiver.recv() {
+                // Per-logger level gate (falls back to root min_level when no specific config matches)
+                let eff_level = effective_logger_level(
+                    event.logger_name.as_deref().unwrap_or(""),
+                    min_level,
+                    &logger_configs,
+                );
+                if event.level < eff_level { continue; }
+
+                // Custom filters
+                let mut denied = false;
+                for filter in &filters {
+                    match filter {
+                        LogFilter::Threshold { min_level } => {
+                            if event.level < *min_level { denied = true; break; }
+                        }
+                        LogFilter::Regex { pattern, deny_on_match } => {
+                            let m = pattern.is_match(&event.message);
+                            if (m && *deny_on_match) || (!m && !*deny_on_match) {
+                                denied = true; break;
+                            }
+                        }
+                    }
+                }
+                if denied { continue; }
+
+                let formatted = match layout_type {
+                    LayoutType::Json    => format_json(&event),
+                    LayoutType::Pattern => apply_pattern(&pattern, &event),
+                };
+                let bytes = formatted.as_bytes();
+
+                if use_console {
+                    let _ = std::io::stdout().write_all(bytes);
+                }
+                if let Some(ref mut fw) = file_writer {
+                    let _ = fw.write_all(bytes);
                 }
             }
         });
-        
+
         sender
     };
 }
 
+// ── C API ─────────────────────────────────────────────────────────────────────
+
 #[no_mangle]
 pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
-    if xml_ptr.is_null() {
-        return -1;
-    }
-    
+    if xml_ptr.is_null() { return -1; }
     let c_str = unsafe { CStr::from_ptr(xml_ptr) };
-    if let Ok(xml_str) = c_str.to_str() {
-        println!("Rust received XML length: {}", xml_str.len());
-        let mut reader = Reader::from_str(xml_str);
-        reader.trim_text(true);
-        
-        let mut config = CONFIG.lock().unwrap();
-        
-        let mut buf = Vec::new();
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
-                    let name = e.name();
-                    let name_str = String::from_utf8_lossy(name.as_ref());
-                    
-                    if name_str.eq_ignore_ascii_case("File") {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"fileName" {
-                                    if let Ok(file_name) = String::from_utf8(attr.value.into_owned()) {
-                                        println!("Rust extracted file name: {}", file_name);
-                                        config.file_name = Some(file_name);
-                                        config.rolling_policy = RollingPolicy::Never;
-                                    }
-                                }
+    let xml_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    println!("Rust received XML length: {}", xml_str.len());
+    let mut reader = Reader::from_str(xml_str);
+    reader.trim_text(true);
+
+    let mut config = CONFIG.lock().unwrap();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
+                let name_str = String::from_utf8_lossy(e.name().as_ref()).to_string();
+
+                if name_str.eq_ignore_ascii_case("Console") {
+                    println!("Rust detected Console appender");
+                    config.console_enabled = true;
+
+                } else if name_str.eq_ignore_ascii_case("PatternLayout") {
+                    config.layout_type = LayoutType::Pattern;
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"pattern" {
+                            if let Ok(pat) = String::from_utf8(attr.value.into_owned()) {
+                                println!("Rust extracted pattern: {}", pat);
+                                config.pattern = pat;
                             }
                         }
-                    } else if name_str.eq_ignore_ascii_case("RollingFile") {
-                        let mut file_name = None;
-                        let mut policy = RollingPolicy::Never;
-                        
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"fileName" {
-                                    if let Ok(f_name) = String::from_utf8(attr.value.into_owned()) {
-                                        file_name = Some(f_name);
-                                    }
-                                } else if attr.key.as_ref() == b"filePattern" {
-                                    if let Ok(pattern) = String::from_utf8(attr.value.into_owned()) {
-                                        if pattern.contains("HH") {
-                                            policy = RollingPolicy::Hourly;
-                                        } else if pattern.contains("%d{") {
-                                            policy = RollingPolicy::Daily;
-                                        }
-                                    }
-                                }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("JsonLayout") {
+                    println!("Rust detected JsonLayout");
+                    config.layout_type = LayoutType::Json;
+
+                } else if name_str.eq_ignore_ascii_case("File") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"fileName" {
+                            if let Ok(f) = String::from_utf8(attr.value.into_owned()) {
+                                println!("Rust extracted file name: {}", f);
+                                config.file_name = Some(f);
+                                config.rolling_policy = RollingPolicy::Never;
                             }
                         }
-                        
-                        if let Some(f_name) = file_name {
-                            println!("Rust extracted rolling file name: {:?}", f_name);
-                            config.file_name = Some(f_name);
-                            config.rolling_policy = policy;
-                        }
-                    } else if name_str.eq_ignore_ascii_case("JsonLayout") {
-                        println!("Rust detected JsonLayout");
-                        config.layout_type = LayoutType::Json;
-                    } else if name_str.eq_ignore_ascii_case("AsyncQueueFullPolicy") {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"type" {
-                                    if let Ok(policy_type) = String::from_utf8(attr.value.into_owned()) {
-                                        if policy_type.eq_ignore_ascii_case("Block") {
-                                            println!("Rust configured to BLOCK on full queue");
-                                            QUEUE_POLICY.store(1, Ordering::SeqCst);
-                                        } else {
-                                            QUEUE_POLICY.store(0, Ordering::SeqCst);
-                                        }
-                                    }
-                                }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("RollingFile") {
+                    let mut fname = None;
+                    let mut policy = RollingPolicy::Never;
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"fileName" {
+                            if let Ok(f) = String::from_utf8(attr.value.into_owned()) {
+                                fname = Some(f);
+                            }
+                        } else if attr.key.as_ref() == b"filePattern" {
+                            if let Ok(p) = String::from_utf8(attr.value.into_owned()) {
+                                if p.contains("HH") { policy = RollingPolicy::Hourly; }
+                                else if p.contains("%d{") { policy = RollingPolicy::Daily; }
                             }
                         }
-                    } else if name_str.eq_ignore_ascii_case("SizeBasedTriggeringPolicy") {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"size" {
-                                    if let Ok(size_str) = String::from_utf8(attr.value.into_owned()) {
-                                        let size_str = size_str.to_uppercase();
-                                        let mut size: u64 = Default::default();
-                                        if size_str.ends_with("MB") {
-                                            if let Ok(val) = size_str.trim_end_matches("MB").trim().parse::<u64>() {
-                                                size = val * 1024 * 1024;
-                                            }
-                                        } else if size_str.ends_with("KB") {
-                                            if let Ok(val) = size_str.trim_end_matches("KB").trim().parse::<u64>() {
-                                                size = val * 1024;
-                                            }
-                                        } else {
-                                            if let Ok(val) = size_str.parse::<u64>() {
-                                                size = val;
-                                            }
-                                        }
-                                        println!("Rust configured SizeBasedTriggeringPolicy: {} bytes", size);
-                                        config.max_size = Some(size);
-                                    }
-                                }
+                    }
+                    if let Some(f) = fname {
+                        println!("Rust extracted rolling file name: {}", f);
+                        config.file_name   = Some(f);
+                        config.rolling_policy = policy;
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("SizeBasedTriggeringPolicy") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"size" {
+                            if let Ok(s) = String::from_utf8(attr.value.into_owned()) {
+                                let up = s.to_uppercase();
+                                let bytes: u64 = if up.ends_with("MB") {
+                                    up.trim_end_matches("MB").trim().parse::<u64>().unwrap_or(0) * 1024 * 1024
+                                } else if up.ends_with("KB") {
+                                    up.trim_end_matches("KB").trim().parse::<u64>().unwrap_or(0) * 1024
+                                } else {
+                                    up.parse::<u64>().unwrap_or(0)
+                                };
+                                println!("Rust configured SizeBasedTriggeringPolicy: {} bytes", bytes);
+                                config.max_size = Some(bytes);
                             }
                         }
-                    } else if name_str.eq_ignore_ascii_case("DefaultRolloverStrategy") {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"max" {
-                                    if let Ok(max_str) = String::from_utf8(attr.value.into_owned()) {
-                                        if let Ok(max_val) = max_str.parse::<usize>() {
-                                            println!("Rust configured DefaultRolloverStrategy max: {}", max_val);
-                                            config.max_files = max_val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if name_str.eq_ignore_ascii_case("Root") {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"level" {
-                                    if let Ok(level_str) = String::from_utf8(attr.value.into_owned()) {
-                                        config.level = match level_str.to_uppercase().as_str() {
-                                            "TRACE" => tracing::Level::TRACE,
-                                            "DEBUG" => tracing::Level::DEBUG,
-                                            "INFO" => tracing::Level::INFO,
-                                            "WARN" => tracing::Level::WARN,
-                                            "ERROR" | "FATAL" => tracing::Level::ERROR,
-                                            _ => tracing::Level::INFO,
-                                        };
-                                    }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("DefaultRolloverStrategy") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"max" {
+                            if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    println!("Rust configured DefaultRolloverStrategy max: {}", n);
+                                    config.max_files = n;
                                 }
                             }
                         }
                     }
-                },
-                Ok(Event::Eof) => break,
-                Err(_) => break,
-                _ => (),
+
+                } else if name_str.eq_ignore_ascii_case("Root") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"level" {
+                            if let Ok(l) = String::from_utf8(attr.value.into_owned()) {
+                                config.min_level = match l.to_uppercase().as_str() {
+                                    "TRACE" => 1,
+                                    "DEBUG" => 2,
+                                    "INFO"  => 3,
+                                    "WARN"  => 4,
+                                    "ERROR" | "FATAL" => 5,
+                                    _ => 3,
+                                };
+                            }
+                        }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("AsyncQueueFullPolicy") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"type" {
+                            if let Ok(t) = String::from_utf8(attr.value.into_owned()) {
+                                if t.eq_ignore_ascii_case("Block") {
+                                    println!("Rust configured to BLOCK on full queue");
+                                    QUEUE_POLICY.store(1, Ordering::SeqCst);
+                                } else {
+                                    QUEUE_POLICY.store(0, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("ThresholdFilter") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"level" {
+                            if let Ok(l) = String::from_utf8(attr.value.into_owned()) {
+                                let lvl = match l.to_uppercase().as_str() {
+                                    "TRACE" => 1, "DEBUG" => 2, "INFO" => 3,
+                                    "WARN"  => 4, "ERROR" | "FATAL" => 5, _ => 3,
+                                };
+                                println!("Rust configured ThresholdFilter min_level={}", lvl);
+                                config.filters.push(LogFilter::Threshold { min_level: lvl });
+                            }
+                        }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("RegexFilter") {
+                    let mut pat_str: Option<String> = None;
+                    let mut deny_on_match = true;
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"regex" {
+                            if let Ok(r) = String::from_utf8(attr.value.into_owned()) {
+                                pat_str = Some(r);
+                            }
+                        } else if attr.key.as_ref() == b"onMatch" {
+                            if let Ok(a) = String::from_utf8(attr.value.into_owned()) {
+                                deny_on_match = a.eq_ignore_ascii_case("DENY");
+                            }
+                        }
+                    }
+                    if let Some(ps) = pat_str {
+                        if let Ok(re) = regex::Regex::new(&ps) {
+                            println!("Rust configured RegexFilter: pattern='{}' deny={}", ps, deny_on_match);
+                            config.filters.push(LogFilter::Regex { pattern: re, deny_on_match });
+                        }
+                    }
+
+                } else if name_str.eq_ignore_ascii_case("Logger") {
+                    // Per-logger level: <Logger name="com.example.db" level="WARN" additivity="true"/>
+                    let mut logger_name = String::new();
+                    let mut logger_level: Option<i32> = None;
+                    let mut additivity = true;
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"name" {
+                            if let Ok(n) = String::from_utf8(attr.value.into_owned()) {
+                                logger_name = n;
+                            }
+                        } else if attr.key.as_ref() == b"level" {
+                            if let Ok(l) = String::from_utf8(attr.value.into_owned()) {
+                                logger_level = Some(match l.to_uppercase().as_str() {
+                                    "TRACE" => 1, "DEBUG" => 2, "INFO" => 3,
+                                    "WARN"  => 4, "ERROR" | "FATAL" => 5, _ => 3,
+                                });
+                            }
+                        } else if attr.key.as_ref() == b"additivity" {
+                            if let Ok(a) = String::from_utf8(attr.value.into_owned()) {
+                                additivity = !a.eq_ignore_ascii_case("false");
+                            }
+                        }
+                    }
+                    if !logger_name.is_empty() {
+                        let lvl = logger_level.unwrap_or(config.min_level);
+                        println!("Rust configured Logger '{}' level={} additivity={}", logger_name, lvl, additivity);
+                        config.loggers.push(PerLoggerConfig {
+                            name: logger_name,
+                            min_level: lvl,
+                            additivity,
+                        });
+                    }
+                }
             }
-            buf.clear();
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
         }
-        return 0; // Success
+        buf.clear();
     }
-    
-    -1 // Error
+    0
 }
 
 #[no_mangle]
 pub extern "C" fn rlog_init() -> i32 {
+    // Touch LOG_SENDER to force lazy initialisation with current CONFIG
     let _ = LOG_SENDER.len();
     0
 }
@@ -316,103 +744,113 @@ pub extern "C" fn rlog_log(level: i32, msg_ptr: *const c_char) {
 
 #[no_mangle]
 pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_ptr: *const c_char) {
-    if msg_ptr.is_null() {
-        return;
-    }
-    
+    if msg_ptr.is_null() { return; }
     let c_str = unsafe { CStr::from_ptr(msg_ptr) };
-    if let Ok(str_slice) = c_str.to_str() {
-        let mut context = None;
-        if !ctx_ptr.is_null() {
-            let ctx_str = unsafe { CStr::from_ptr(ctx_ptr) };
-            if let Ok(ctx_slice) = ctx_str.to_str() {
-                context = Some(ctx_slice.to_owned());
-            }
-        }
-
-        let event = LogEvent {
-            level,
-            message: str_slice.to_owned(),
-            context,
+    if let Ok(msg) = c_str.to_str() {
+        let context = if ctx_ptr.is_null() { None } else {
+            unsafe { CStr::from_ptr(ctx_ptr) }.to_str().ok().map(str::to_owned)
         };
-        
-        if QUEUE_POLICY.load(Ordering::Relaxed) == 1 {
-            let _ = LOG_SENDER.send(event);
-        } else {
-            let _ = LOG_SENDER.try_send(event);
-        }
+        send_event(LogEvent {
+            level,
+            message: msg.to_owned(),
+            context,
+            logger_name: None,
+            thread_name: None,
+            timestamp: Utc::now(),
+        });
     }
 }
 
 #[no_mangle]
 pub extern "C" fn rlog_flush() {
-    // Wait for the queue to empty
     while !LOG_SENDER.is_empty() {
-        thread::sleep(std::time::Duration::from_millis(10));
+        thread::sleep(std::time::Duration::from_millis(5));
     }
-    // Give the tracing appender background thread a moment to flush to disk
-    thread::sleep(std::time::Duration::from_millis(100));
+    // Give the background I/O thread a moment to finish any in-flight write
+    thread::sleep(std::time::Duration::from_millis(50));
 }
 
-// --- JNI WRAPPERS FOR UNIVERSAL JAVA SUPPORT (Java 8+) ---
+// ── JNI wrappers (Java 8+) ────────────────────────────────────────────────────
+
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
-use jni::sys::{jint};
+use jni::sys::jint;
+
+fn jstring_to_opt(env: &mut JNIEnv, js: &JString) -> Option<String> {
+    env.get_string(js).ok().map(|s| String::from(s))
+        .filter(|s| !s.is_empty())
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1init(
-    _env: JNIEnv,
-    _class: JClass,
+    _env: JNIEnv, _class: JClass,
 ) -> jint {
     rlog_init()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1configure(
-    mut env: JNIEnv,
-    _class: JClass,
-    xml_content: JString,
+    mut env: JNIEnv, _class: JClass, xml_content: JString,
 ) -> jint {
-    if let Ok(xml_str) = env.get_string(&xml_content) {
-        let xml_ptr = xml_str.as_ptr();
-        return rlog_configure(xml_ptr);
-    }
-    -1
+    if let Ok(s) = env.get_string(&xml_content) {
+        rlog_configure(s.as_ptr())
+    } else { -1 }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log(
-    mut env: JNIEnv,
-    _class: JClass,
-    level: jint,
-    message: JString,
+    mut env: JNIEnv, _class: JClass, level: jint, message: JString,
 ) {
-    if let Ok(msg_str) = env.get_string(&message) {
-        rlog_log(level, msg_str.as_ptr());
+    if let Ok(msg) = env.get_string(&message) {
+        rlog_log(level, msg.as_ptr());
     }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log_1with_1context(
-    mut env: JNIEnv,
-    _class: JClass,
-    level: jint,
-    message: JString,
-    context: JString,
+    mut env: JNIEnv, _class: JClass, level: jint, message: JString, context: JString,
 ) {
-    if let Ok(msg_str) = env.get_string(&message) {
-        if let Ok(ctx_str) = env.get_string(&context) {
-            rlog_log_with_context(level, msg_str.as_ptr(), ctx_str.as_ptr());
+    if let Ok(msg) = env.get_string(&message) {
+        if let Ok(ctx) = env.get_string(&context) {
+            rlog_log_with_context(level, msg.as_ptr(), ctx.as_ptr());
         } else {
-            rlog_log(level, msg_str.as_ptr());
+            rlog_log(level, msg.as_ptr());
         }
     }
 }
 
+/// Full-featured log call: carries logger name and thread name across JNI so
+/// PatternLayout specifiers %logger and %thread work correctly.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1log_1full(
+    mut env: JNIEnv, _class: JClass,
+    level: jint,
+    message: JString,
+    context: JString,
+    logger_name: JString,
+    thread_name: JString,
+) {
+    let msg = match env.get_string(&message) {
+        Ok(s) => String::from(s),
+        Err(_) => return,
+    };
+    let context     = jstring_to_opt(&mut env, &context);
+    let logger_name = jstring_to_opt(&mut env, &logger_name);
+    let thread_name = jstring_to_opt(&mut env, &thread_name);
+
+    send_event(LogEvent {
+        level,
+        message: msg,
+        context,
+        logger_name,
+        thread_name,
+        timestamp: Utc::now(),
+    });
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLogger_rlog_1flush(
-    _env: JNIEnv,
-    _class: JClass,
+    _env: JNIEnv, _class: JClass,
 ) {
     rlog_flush();
 }

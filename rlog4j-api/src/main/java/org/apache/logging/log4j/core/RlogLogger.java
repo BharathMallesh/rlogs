@@ -14,45 +14,52 @@ public class RlogLogger extends AbstractLogger {
 
     @Override
     public Level getLevel() {
-        return Level.ALL;
+        return NativeLogger.getEffectiveLevel(getName());
     }
 
-    private boolean isEnabled() {
-        return true;
+    /**
+     * Uses the per-logger hierarchy so that e.g. logger.debug() on a logger
+     * configured at DEBUG is enabled even when Root is INFO.
+     * This also enables lambda lazy logging: logger.debug(() -> expensive())
+     * skips evaluation entirely when the effective level is INFO or above.
+     */
+    private boolean isLevelEnabled(Level level) {
+        return level != null
+            && level.intLevel() <= NativeLogger.getEffectiveLevel(getName()).intLevel();
     }
 
     @Override
-    public boolean isEnabled(Level level, Marker marker, Message message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, Message message, Throwable t) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, CharSequence message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, CharSequence message, Throwable t) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, Object message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, Object message, Throwable t) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Throwable t) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object... params) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object... params) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8) { return isLevelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8, Object p9) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8, Object p9) { return isLevelEnabled(level); }
 
     @Override
     public void logMessage(String fqcn, Level level, Marker marker, Message message, Throwable t) {
@@ -70,11 +77,22 @@ public class RlogLogger extends AbstractLogger {
         
         // Extract MDC context
         java.util.Map<String, String> contextMap = org.apache.logging.log4j.ThreadContext.getContext();
-        String mdcString = null;
-        if (contextMap != null && !contextMap.isEmpty()) {
-            mdcString = contextMap.toString();
+        StringBuilder ctxBuilder = new StringBuilder();
+
+        // Prepend marker if present
+        if (marker != null) {
+            ctxBuilder.append("marker=").append(marker.getName());
         }
+
+        // Append MDC entries
+        if (contextMap != null && !contextMap.isEmpty()) {
+            if (ctxBuilder.length() > 0) ctxBuilder.append(", ");
+            ctxBuilder.append(contextMap.toString(), 1, contextMap.toString().length() - 1); // strip { }
+        }
+
+        String mdcString = ctxBuilder.length() > 0 ? "{" + ctxBuilder.toString() + "}" : null;
         
-        NativeLogger.log(rustLevel, formattedMsg, mdcString);
+        NativeLogger.log(rustLevel, formattedMsg, mdcString,
+                getName(), Thread.currentThread().getName());
     }
 }
