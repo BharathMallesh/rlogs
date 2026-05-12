@@ -657,9 +657,11 @@ fn build_file_writer(
         match rolling_policy {
             RollingPolicy::Hourly => Some(Box::new(tracing_appender::rolling::hourly(dir, prefix))),
             RollingPolicy::Daily  => Some(Box::new(tracing_appender::rolling::daily(dir, prefix))),
+            // Use a direct file handle (no BufWriter) so log lines are visible
+            // on disk immediately — matters for downstream tail / fsync consumers.
             RollingPolicy::Never  =>
                 match std::fs::OpenOptions::new().create(true).append(true).open(f_name) {
-                    Ok(f)  => Some(Box::new(std::io::BufWriter::new(f))),
+                    Ok(f)  => Some(Box::new(f)),
                     Err(e) => { eprintln!("Rlog4 Error: cannot open {}: {}", f_name, e); None }
                 },
         }
