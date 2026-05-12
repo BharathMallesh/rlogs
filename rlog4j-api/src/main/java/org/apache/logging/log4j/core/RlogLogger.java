@@ -70,7 +70,6 @@ public class RlogLogger extends AbstractLogger {
         else if (level == Level.WARN) rustLevel = 4;
         else if (level == Level.ERROR || level == Level.FATAL) rustLevel = 5;
 
-        // Clean message — no exception appended; %ex in the pattern handles that
         String formattedMsg = message.getFormattedMessage();
 
         // Full exception stack trace via %ex
@@ -81,25 +80,48 @@ public class RlogLogger extends AbstractLogger {
             exceptionStr = sw.toString();
         }
 
-        // MDC flat map
+        // MDC flat map (marker kept separate, no longer packed into MDC)
         java.util.Map<String, String> contextMap = org.apache.logging.log4j.ThreadContext.getContext();
-        StringBuilder ctxBuilder = new StringBuilder();
-        if (marker != null) {
-            ctxBuilder.append("marker=").append(marker.getName());
-        }
+        String mdcString = null;
         if (contextMap != null && !contextMap.isEmpty()) {
-            if (ctxBuilder.length() > 0) ctxBuilder.append(", ");
             String mapStr = contextMap.toString();
-            ctxBuilder.append(mapStr, 1, mapStr.length() - 1); // strip { }
+            mdcString = "{" + mapStr.substring(1, mapStr.length() - 1) + "}";
         }
-        String mdcString = ctxBuilder.length() > 0 ? "{" + ctxBuilder + "}" : null;
 
-        // NDC stack (space-separated; rendered by %x in pattern)
+        // NDC stack (space-separated; rendered by %x)
         java.util.List<String> ndcStack =
             org.apache.logging.log4j.ThreadContext.getImmutableStack().asList();
         String ndcString = ndcStack.isEmpty() ? null : String.join(" ", ndcStack);
 
+        // Feature 9: Marker name
+        String markerName = (marker != null) ? marker.getName() : null;
+
+        // Feature 8: Caller location.
+        // Match only the specific bridge classes (not the entire package) so that
+        // application code that happens to live in org.apache.logging.* is not skipped.
+        String callerClass = null, callerMethod = null, callerFile = null, callerLine = null;
+        try {
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            int lastFwFrame = -1;
+            for (int j = 0; j < stack.length; j++) {
+                String cls = stack[j].getClassName();
+                if (cls.equals("java.lang.Thread")
+                        || cls.equals("org.apache.logging.log4j.spi.AbstractLogger")
+                        || cls.equals(RlogLogger.class.getName())) {
+                    lastFwFrame = j;
+                }
+            }
+            if (lastFwFrame >= 0 && lastFwFrame + 1 < stack.length) {
+                StackTraceElement f = stack[lastFwFrame + 1];
+                callerClass  = f.getClassName();
+                callerMethod = f.getMethodName();
+                callerFile   = f.getFileName() != null ? f.getFileName() : "?";
+                callerLine   = String.valueOf(f.getLineNumber());
+            }
+        } catch (Exception ignored) {}
+
         NativeLogger.log(rustLevel, formattedMsg, mdcString, ndcString,
-                getName(), Thread.currentThread().getName(), exceptionStr);
+                getName(), Thread.currentThread().getName(), exceptionStr,
+                markerName, callerClass, callerMethod, callerFile, callerLine);
     }
 }

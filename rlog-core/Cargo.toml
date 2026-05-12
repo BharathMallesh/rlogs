@@ -15,3 +15,4 @@ jni = "0.21"
 rolling-file = "0.2"
 regex = "1"
 chrono = { version = "0.4", features = ["std"] }
+ureq  = { version = "2", default-features = false }

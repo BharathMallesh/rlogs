@@ -29,6 +29,18 @@ public class NativeLogger {
                                              String threadName,
                                              String exception);
 
+    /**
+     * Extended call: adds marker (Feature 9) and caller location (Feature 8)
+     * on top of the 7-param rlog_log_full signature.
+     */
+    private static native void rlog_log_full2(int level, String message,
+                                              String mdc, String ndc,
+                                              String loggerName, String threadName,
+                                              String exception,
+                                              String marker,
+                                              String callerClass, String callerMethod,
+                                              String callerFile, String callerLine);
+
     private static native void rlog_flush();
 
     /** Runtime reconfiguration — safe to call after rlog_init(). */
@@ -42,8 +54,9 @@ public class NativeLogger {
     private static final java.util.concurrent.ConcurrentHashMap<String, Level> LOGGER_LEVEL_MAP =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    // Feature 10: extended lookup — env, sys, date, ctx
     private static final Pattern LOOKUP_PATTERN =
-        Pattern.compile("\\$\\{(env|sys):([^}:]+)(?::-(.*?))?\\}");
+        Pattern.compile("\\$\\{(env|sys|date|ctx):([^}:]+)(?::-(.*?))?\\}");
     private static final Pattern ROOT_LEVEL_PATTERN =
         Pattern.compile("<Root[^>]+level=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
     // Matches <Logger ...> or <Logger ... /> — captures the attribute block
@@ -122,7 +135,7 @@ public class NativeLogger {
 
     // ── Lookup resolution ──────────────────────────────────────────────────
 
-    static String resolveLookups(String xml) {
+    public static String resolveLookups(String xml) {
         if (xml == null) return null;
         Matcher m = LOOKUP_PATTERN.matcher(xml);
         StringBuffer sb = new StringBuffer();
@@ -131,8 +144,26 @@ public class NativeLogger {
             String key        = m.group(2);
             String defaultVal = m.group(3);
 
-            String resolved = "env".equals(type) ? System.getenv(key)
-                                                  : System.getProperty(key);
+            String resolved;
+            switch (type) {
+                case "env":  resolved = System.getenv(key); break;
+                case "sys":  resolved = System.getProperty(key); break;
+                case "date":
+                    try {
+                        resolved = new java.text.SimpleDateFormat(
+                                key.isEmpty() ? "yyyy-MM-dd" : key)
+                                .format(new java.util.Date());
+                    } catch (Exception e) {
+                        resolved = defaultVal;
+                    }
+                    break;
+                case "ctx":
+                    java.util.Map<String, String> ctxMap =
+                            org.apache.logging.log4j.ThreadContext.getContext();
+                    resolved = ctxMap != null ? ctxMap.get(key) : null;
+                    break;
+                default: resolved = null;
+            }
             if (resolved == null) resolved = (defaultVal != null) ? defaultVal : "";
             m.appendReplacement(sb, Matcher.quoteReplacement(resolved));
         }
@@ -319,6 +350,36 @@ public class NativeLogger {
                 loggerName != null ? loggerName : "",
                 threadName != null ? threadName : Thread.currentThread().getName(),
                 exception  != null ? exception  : ""
+            );
+        } catch (Throwable t) {
+            System.err.println("Rlog4 Native Log Failure: " + message);
+        }
+    }
+
+    /**
+     * Extended call with marker (Feature 9) and caller location (Feature 8).
+     * Used by RlogLogger when include_location is enabled.
+     */
+    public static void log(int level, String message,
+                           String mdcString, String ndcString,
+                           String loggerName, String threadName,
+                           String exception,
+                           String marker,
+                           String callerClass, String callerMethod,
+                           String callerFile, String callerLine) {
+        try {
+            rlog_log_full2(
+                level, message,
+                mdcString  != null ? mdcString  : "",
+                ndcString  != null ? ndcString  : "",
+                loggerName != null ? loggerName : "",
+                threadName != null ? threadName : Thread.currentThread().getName(),
+                exception  != null ? exception  : "",
+                marker     != null ? marker     : "",
+                callerClass  != null ? callerClass  : "",
+                callerMethod != null ? callerMethod : "",
+                callerFile   != null ? callerFile   : "",
+                callerLine   != null ? callerLine   : ""
             );
         } catch (Throwable t) {
             System.err.println("Rlog4 Native Log Failure: " + message);
