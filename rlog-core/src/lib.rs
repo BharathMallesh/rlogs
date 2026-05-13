@@ -45,20 +45,13 @@ enum LogFilter {
     DynamicThreshold { mdc_key: String, default_level: i32 },
 }
 
-// LogFilter must be Clone (background thread takes a snapshot).
-// Arc<Mutex<>> inside Burst is cheaply cloneable.
-impl Clone for BurstState {
-    fn clone(&self) -> Self {
-        BurstState { count: self.count, window_start: self.window_start }
-    }
-}
-
-/// Per-logger level override (mirrors <Logger name="..." level="..." additivity="..."/>)
+/// Per-logger level override (mirrors `<Logger name="..." level="..."/>`).
+/// (The `additivity` attribute from Log4j2 is parsed but currently has no
+/// behavioural effect — there is only one appender pipeline.)
 #[derive(Clone)]
 struct PerLoggerConfig {
-    name:       String,
-    min_level:  i32,
-    additivity: bool,
+    name:      String,
+    min_level: i32,
 }
 
 struct RlogConfig {
@@ -86,8 +79,6 @@ struct RlogConfig {
     filters:         Vec<LogFilter>,
     console_enabled: bool,
     loggers:         Vec<PerLoggerConfig>,
-    // Caller location capture (requires Java-side stack walk)
-    include_location: bool,
 }
 
 lazy_static! {
@@ -110,7 +101,6 @@ lazy_static! {
         filters:          Vec::new(),
         console_enabled:  false,
         loggers:          Vec::new(),
-        include_location: false,
     });
 }
 
@@ -1021,7 +1011,8 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                     }
 
                 } else if name_str.eq_ignore_ascii_case("Logger") {
-                    let mut lname = String::new(); let mut llevel = None; let mut additivity = true;
+                    let mut lname = String::new();
+                    let mut llevel = None;
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"name" {
                             if let Ok(v) = String::from_utf8(attr.value.into_owned()) { lname = v; }
@@ -1029,16 +1020,15 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                             if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
                                 llevel = Some(parse_level_str(&v));
                             }
-                        } else if attr.key.as_ref() == b"additivity" {
-                            if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
-                                additivity = !v.eq_ignore_ascii_case("false");
-                            }
                         }
+                        // `additivity` is accepted by the XML grammar but ignored —
+                        // we have a single appender pipeline so there is nothing to
+                        // forward log events to.
                     }
                     if !lname.is_empty() {
                         let lvl = llevel.unwrap_or(config.min_level);
-                        println!("Rust configured Logger '{}' level={} additivity={}", lname, lvl, additivity);
-                        config.loggers.push(PerLoggerConfig { name: lname, min_level: lvl, additivity });
+                        println!("Rust configured Logger '{}' level={}", lname, lvl);
+                        config.loggers.push(PerLoggerConfig { name: lname, min_level: lvl });
                     }
 
                 // Async queue policy ──────────────────────────────────────────
