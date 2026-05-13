@@ -1,4 +1,11 @@
+# JitPack build recipe.
+#
+# JitPack's stock images don't include a real JDK 22 yet (the `openjdk22` key
+# resolves to an older JDK that doesn't accept --release 22). To work around
+# that we run Gradle on whatever JDK JitPack has (openjdk21 is solid), and
+# Gradle's toolchain feature auto-downloads Temurin 22 to do the actual
+# Java-22 compile.
 jdk:
-  - openjdk22
+  - openjdk21
 install:
-  - ./gradlew :rlog4j-api:publishToMavenLocal
+  - ./gradlew :rlog4j-api:publishToMavenLocal -Porg.gradle.java.installations.auto-detect=true -Porg.gradle.java.installations.auto-download=true

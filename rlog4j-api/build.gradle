@@ -11,10 +11,12 @@ repositories {
 }
 
 java {
-    // FFM (java.lang.foreign) requires Java 22+. Keep this in sync with the
-    // toolchain used in CI (Java 23 on this workstation).
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    // FFM (java.lang.foreign) requires Java 22+. Use a Gradle toolchain so
+    // that even build environments without a Java 22 JDK installed (e.g.
+    // JitPack's default image) auto-download Temurin 22 to compile against.
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(22)
+    }
 }
 
 dependencies {

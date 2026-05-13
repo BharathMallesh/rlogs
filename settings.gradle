@@ -1,3 +1,10 @@
+// Foojay resolver — lets Gradle auto-download a Temurin JDK matching the
+// toolchain spec in build.gradle. Required for JitPack and other CI
+// environments that don't pre-install Java 22+.
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+
 rootProject.name = 'rlog4'
 include 'rlog4j-api'
 include 'rlog-benchmark'
