@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>dummy-app</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+    <name>rlog4 dummy app</name>
+    <description>Minimal example app that pulls rlog4 from GitHub via JitPack</description>
+
+    <properties>
+        <maven.compiler.source>22</maven.compiler.source>
+        <maven.compiler.target>22</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <exec.mainClass>com.example.myapp.DummyApp</exec.mainClass>
+    </properties>
+
+    <!--
+        JitPack builds rlog4 directly from GitHub on demand.
+        Repo coordinates: com.github.<github-user>:<repo-name>
+        Version: a git tag (preferred), branch-SNAPSHOT, or short commit SHA.
+    -->
+    <repositories>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github.BharathMallesh</groupId>
+            <artifactId>rlogs</artifactId>
+            <!--
+                Branch builds: replace '/' with '~' and append -SNAPSHOT.
+                e.g. branch feature/ffm-bridge → feature~ffm-bridge-SNAPSHOT
+                Once a tag (e.g. v0.1.0) is pushed, prefer that for reproducible builds.
+            -->
+            <version>feature~ffm-bridge-SNAPSHOT</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+
+            <!-- `mvn exec:exec` runs the app with the FFM flag set. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <executable>java</executable>
+                    <arguments>
+                        <argument>--enable-native-access=ALL-UNNAMED</argument>
+                        <argument>-classpath</argument>
+                        <classpath/>
+                        <argument>${exec.mainClass}</argument>
+                    </arguments>
+                </configuration>
+            </plugin>
+
+            <!-- Build a self-contained "fat" jar via `mvn package`. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>${exec.mainClass}</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

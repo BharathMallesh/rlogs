@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level [%marker] %logger{36} %X %x - %msg%n%ex"/>
+        </Console>
+
+        <File name="File" fileName="logs/dummy-app.log">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level [%marker] %logger{36} %X %x - %msg%n%ex"/>
+        </File>
+    </Appenders>
+
+    <Loggers>
+        <!-- Per-logger level overrides (Feature 2). Trim a chatty namespace
+             without changing the root level. -->
+        <Logger name="com.example.myapp" level="DEBUG" additivity="true"/>
+
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="File"/>
+        </Root>
+    </Loggers>
+</Configuration>
