@@ -9,6 +9,7 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.io.InputStream;
 import java.util.Scanner;
+import org.apache.logging.log4j.Level;
 
 public class NativeLogger {
     private static final Linker linker = Linker.nativeLinker();
@@ -16,8 +17,14 @@ public class NativeLogger {
     private static final MethodHandle rlogInitHandle;
     private static final MethodHandle rlogLogHandle;
     private static final MethodHandle rlogConfigureHandle;
-
     private static final MethodHandle rlogLogWithContextHandle;
+
+    // Thread-local pre-allocated buffer (8KB) to avoid Arena malloc/free per log call
+    private static final ThreadLocal<MemorySegment> THREAD_BUF =
+        ThreadLocal.withInitial(() -> Arena.global().allocate(8192));
+    private static final int MAX_INLINE_BYTES = 8000;
+
+    static volatile Level configuredLevel = Level.INFO;
 
     static {
         NativeLoader.load();
@@ -40,19 +47,18 @@ public class NativeLogger {
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
             );
 
-            // Attempt to read log4j2.xml from classpath
             InputStream is = NativeLogger.class.getClassLoader().getResourceAsStream("log4j2.xml");
             if (is != null) {
                 try (Scanner scanner = new Scanner(is, "UTF-8").useDelimiter("\\A")) {
                     String xmlContent = scanner.hasNext() ? scanner.next() : "";
+                    configuredLevel = parseRootLevel(xmlContent);
                     try (Arena arena = Arena.ofConfined()) {
                         MemorySegment xmlSegment = arena.allocateFrom(xmlContent);
-                        int res = (int) rlogConfigureHandle.invokeExact(xmlSegment);
+                        int ignored = (int) rlogConfigureHandle.invokeExact(xmlSegment);
                     }
                 }
             }
 
-            // Initialize the Rust logger
             int status = (int) rlogInitHandle.invokeExact();
             if (status != 0) {
                 throw new RuntimeException("Failed to initialize Rust logger, status: " + status);
@@ -62,19 +68,43 @@ public class NativeLogger {
         }
     }
 
+    private static Level parseRootLevel(String xml) {
+        int rootIdx = xml.indexOf("<Root");
+        if (rootIdx < 0) return Level.INFO;
+        int gt = xml.indexOf('>', rootIdx);
+        int levelIdx = xml.indexOf("level=", rootIdx);
+        if (levelIdx < 0 || levelIdx > gt) return Level.INFO;
+        char quote = xml.charAt(levelIdx + 6);
+        int start = levelIdx + 7;
+        int end = xml.indexOf(quote, start);
+        if (end < 0) return Level.INFO;
+        return Level.toLevel(xml.substring(start, end), Level.INFO);
+    }
+
     public static void log(int level, String message) {
         log(level, message, null);
     }
 
     public static void log(int level, String message, String mdcString) {
-        // Allocate a short-lived arena for the C-String conversion
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment msgSegment = arena.allocateFrom(message);
-            if (mdcString == null || mdcString.isEmpty()) {
-                rlogLogHandle.invokeExact(level, msgSegment);
+        try {
+            byte[] msgBytes = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (msgBytes.length < MAX_INLINE_BYTES && mdcString == null) {
+                // Fast path: reuse thread-local buffer, zero extra allocation
+                MemorySegment buf = THREAD_BUF.get();
+                buf.copyFrom(MemorySegment.ofArray(msgBytes));
+                buf.set(ValueLayout.JAVA_BYTE, msgBytes.length, (byte) 0);
+                rlogLogHandle.invokeExact(level, buf);
             } else {
-                MemorySegment mdcSegment = arena.allocateFrom(mdcString);
-                rlogLogWithContextHandle.invokeExact(level, msgSegment, mdcSegment);
+                // Slow path: message is large or has MDC — use a confined arena
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment msgSegment = arena.allocateFrom(message);
+                    if (mdcString == null || mdcString.isEmpty()) {
+                        rlogLogHandle.invokeExact(level, msgSegment);
+                    } else {
+                        MemorySegment mdcSegment = arena.allocateFrom(mdcString);
+                        rlogLogWithContextHandle.invokeExact(level, msgSegment, mdcSegment);
+                    }
+                }
             }
         } catch (Throwable t) {
             t.printStackTrace();

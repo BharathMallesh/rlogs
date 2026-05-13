@@ -14,45 +14,45 @@ public class RlogLogger extends AbstractLogger {
 
     @Override
     public Level getLevel() {
-        return Level.ALL;
+        return NativeLogger.configuredLevel;
     }
 
-    private boolean isEnabled() {
-        return true;
+    private boolean levelEnabled(Level level) {
+        return level.isMoreSpecificThan(NativeLogger.configuredLevel);
     }
 
     @Override
-    public boolean isEnabled(Level level, Marker marker, Message message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, Message message, Throwable t) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, CharSequence message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, CharSequence message, Throwable t) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, Object message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, Object message, Throwable t) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Throwable t) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Throwable t) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object... params) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object... params) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8) { return levelEnabled(level); }
     @Override
-    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8, Object p9) { return isEnabled(); }
+    public boolean isEnabled(Level level, Marker marker, String message, Object p0, Object p1, Object p2, Object p3, Object p4, Object p5, Object p6, Object p7, Object p8, Object p9) { return levelEnabled(level); }
 
     @Override
     public void logMessage(String fqcn, Level level, Marker marker, Message message, Throwable t) {

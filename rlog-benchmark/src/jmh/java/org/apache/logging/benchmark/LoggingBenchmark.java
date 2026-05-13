@@ -3,6 +3,7 @@ package org.apache.logging.benchmark;
 import org.openjdk.jmh.annotations.*;
 import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.config.Configurator;
+import org.apache.logging.log4j.core.impl.Log4jContextFactory;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.NativeLogger;
 import java.util.concurrent.TimeUnit;
@@ -21,16 +22,17 @@ public class LoggingBenchmark {
 
     @Setup(Level.Trial)
     public void setup() {
-        // Force Log4j2 to use Async Loggers globally
         System.setProperty("log4j2.contextSelector", "org.apache.logging.log4j.core.async.AsyncLoggerContextSelector");
-        
-        // Initialize standard Log4j 2 core explicitly to bypass RlogProvider if needed
+
+        // RlogContextFactory is registered with higher priority via the service loader,
+        // so Configurator.initialize() would return null. Directly instantiate
+        // Log4jContextFactory to get a real async Log4j2 context for the baseline.
         File configFile = new File("src/jmh/resources/log4j2-async.xml");
-        ctx = Configurator.initialize("BenchmarkContext", null, configFile.toURI());
+        Log4jContextFactory factory = new Log4jContextFactory();
+        ctx = (LoggerContext) factory.getContext(
+            LoggingBenchmark.class.getName(), null, null, false, configFile.toURI(), "BenchmarkContext");
         standardLogger = ctx.getLogger(LoggingBenchmark.class.getName());
-        
-        // Initialize our Native FFM logger
-        // NativeLogger is initialized automatically in its static block
+
         NativeLogger.log(3, "Benchmarking starting...");
     }
 
