@@ -5,6 +5,7 @@ import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.config.Configurator;
 import org.apache.logging.log4j.core.impl.Log4jContextFactory;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.NativeLogger;
 import java.util.concurrent.TimeUnit;
 import java.io.File;
@@ -18,6 +19,7 @@ import java.io.File;
 public class LoggingBenchmark {
 
     private Logger standardLogger;
+    private Logger rlogSpiLogger;
     private LoggerContext ctx;
 
     @Setup(Level.Trial)
@@ -33,6 +35,8 @@ public class LoggingBenchmark {
             LoggingBenchmark.class.getName(), null, null, false, configFile.toURI(), "BenchmarkContext");
         standardLogger = ctx.getLogger(LoggingBenchmark.class.getName());
 
+        // Full SPI path: LogManager → RlogContextFactory → RlogLogger → NativeLogger
+        rlogSpiLogger = LogManager.getLogger(LoggingBenchmark.class);
         NativeLogger.log(3, "Benchmarking starting...");
     }
 
@@ -51,5 +55,10 @@ public class LoggingBenchmark {
     @Benchmark
     public void benchmarkRlog4jFFM() {
         NativeLogger.log(3, "This is an Rlog4 FFM log message");
+    }
+
+    @Benchmark
+    public void benchmarkRlog4jSPI() {
+        rlogSpiLogger.info("This is an Rlog4 SPI log message — full Log4j2 path");
     }
 }
