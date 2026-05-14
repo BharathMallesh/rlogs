@@ -79,10 +79,18 @@ public class NativeLogger {
      */
     static volatile boolean LOCATION_REQUIRED = false;
 
+    private static volatile boolean nativeAvailable = true;
+
     // ── Static initialiser ─────────────────────────────────────────────────
 
     static {
-        NativeLoader.load();
+        try {
+            NativeLoader.load();
+        } catch (Throwable t) {
+            nativeAvailable = false;
+            System.err.println("Rlog4 Error: Critical failure during native library load");
+            t.printStackTrace();
+        }
 
         try {
             String xmlContent = null;
@@ -133,14 +141,17 @@ public class NativeLogger {
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 try {
-                    System.out.println("Rlog4: JVM shutting down, flushing async queues…");
-                    rlog_flush();
+                    if (nativeAvailable) {
+                        System.out.println("Rlog4: JVM shutting down, flushing async queues…");
+                        rlog_flush();
+                    }
                 } catch (Throwable t) {
                     System.err.println("Rlog4 Warning: Failed to flush logs on shutdown");
                 }
             }));
 
         } catch (Throwable t) {
+            nativeAvailable = false;
             System.err.println("Rlog4 Error: Critical failure during native initialisation");
             t.printStackTrace();
         }
@@ -367,6 +378,10 @@ public class NativeLogger {
                            String mdcString, String ndcString,
                            String loggerName, String threadName,
                            String exception) {
+        if (!nativeAvailable) {
+            System.out.println(loggerName + " [" + threadName + "] " + message + (exception != null ? "\n" + exception : ""));
+            return;
+        }
         try {
             rlog_log_full(
                 level,
@@ -378,7 +393,8 @@ public class NativeLogger {
                 exception  != null ? exception  : ""
             );
         } catch (Throwable t) {
-            System.err.println("Rlog4 Native Log Failure: " + message);
+            nativeAvailable = false;
+            System.err.println("Rlog4 Native Log Failure: disabling native logger. Original message: " + message);
         }
     }
 
@@ -393,6 +409,10 @@ public class NativeLogger {
                            String marker,
                            String callerClass, String callerMethod,
                            String callerFile, String callerLine) {
+        if (!nativeAvailable) {
+            System.out.println(loggerName + " [" + threadName + "] " + message + (exception != null ? "\n" + exception : ""));
+            return;
+        }
         try {
             rlog_log_full2(
                 level, message,
@@ -408,7 +428,8 @@ public class NativeLogger {
                 callerLine   != null ? callerLine   : ""
             );
         } catch (Throwable t) {
-            System.err.println("Rlog4 Native Log Failure: " + message);
+            nativeAvailable = false;
+            System.err.println("Rlog4 Native Log Failure: disabling native logger. Original message: " + message);
         }
     }
 }
