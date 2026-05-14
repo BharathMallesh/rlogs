@@ -34,10 +34,9 @@ lazy_static! {
     });
 }
 
-struct LogEvent {
-    level: i32,
-    message: String,
-    context: Option<String>,
+enum LogEvent {
+    Message { level: i32, message: String, context: Option<String> },
+    Flush(crossbeam_channel::Sender<()>),
 }
 
 /// Resolve Log4j2-style `${env:VAR:-default}` property expressions using the process environment.
@@ -118,17 +117,24 @@ lazy_static! {
             }
 
             while let Ok(event) = receiver.recv() {
-                let full_message = match event.context {
-                    Some(ctx) => format!("{} {}", event.message, ctx),
-                    None => event.message,
-                };
-                match event.level {
-                    1 => trace!("{}", full_message),
-                    2 => debug!("{}", full_message),
-                    3 => info!("{}", full_message),
-                    4 => warn!("{}", full_message),
-                    5 => error!("{}", full_message),
-                    _ => info!("{}", full_message),
+                match event {
+                    LogEvent::Message { level, message, context } => {
+                        let full_message = match context {
+                            Some(ctx) => format!("{} {}", message, ctx),
+                            None => message,
+                        };
+                        match level {
+                            1 => trace!("{}", full_message),
+                            2 => debug!("{}", full_message),
+                            3 => info!("{}", full_message),
+                            4 => warn!("{}", full_message),
+                            5 => error!("{}", full_message),
+                            _ => info!("{}", full_message),
+                        }
+                    }
+                    LogEvent::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -252,10 +258,24 @@ pub extern "C" fn rlog_log_with_context(level: i32, msg_ptr: *const c_char, ctx_
             None
         };
 
-        let _ = LOG_SENDER.try_send(LogEvent {
+        if let Err(e) = LOG_SENDER.send(LogEvent::Message {
             level,
             message: str_slice.to_owned(),
             context,
-        });
+        }) {
+            if let LogEvent::Message { message, .. } = e.into_inner() {
+                eprintln!("rlog: CRITICAL - log channel closed, message dropped: {}", message);
+            }
+        }
     }
+}
+
+/// Flush all enqueued log messages. Blocks until the background thread has processed
+/// every message that was queued before this call (or until the 5-second timeout).
+/// Called from the JVM shutdown hook to guarantee zero message loss on exit.
+#[no_mangle]
+pub extern "C" fn rlog_flush() {
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+    let _ = LOG_SENDER.send(LogEvent::Flush(ack_tx));
+    let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
 }

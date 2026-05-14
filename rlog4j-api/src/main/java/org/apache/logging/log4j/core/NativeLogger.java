@@ -18,6 +18,7 @@ public class NativeLogger {
     private static final MethodHandle rlogLogHandle;
     private static final MethodHandle rlogConfigureHandle;
     private static final MethodHandle rlogLogWithContextHandle;
+    private static final MethodHandle rlogFlushHandle;
 
     // Thread-local pre-allocated buffer (8KB) to avoid Arena malloc/free per log call
     private static final ThreadLocal<MemorySegment> THREAD_BUF =
@@ -46,6 +47,10 @@ public class NativeLogger {
                 lookup.find("rlog_log_with_context").orElseThrow(),
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
             );
+            rlogFlushHandle = linker.downcallHandle(
+                lookup.find("rlog_flush").orElseThrow(),
+                FunctionDescriptor.ofVoid()
+            );
 
             InputStream is = NativeLogger.class.getClassLoader().getResourceAsStream("log4j2.xml");
             if (is != null) {
@@ -63,6 +68,10 @@ public class NativeLogger {
             if (status != 0) {
                 throw new RuntimeException("Failed to initialize Rust logger, status: " + status);
             }
+
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { rlogFlushHandle.invokeExact(); } catch (Throwable ignored) {}
+            }, "rlog-shutdown"));
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }
