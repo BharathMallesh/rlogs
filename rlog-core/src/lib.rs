@@ -4,7 +4,10 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::panic;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
 use crossbeam_channel::{bounded, Sender};
 use lazy_static::lazy_static;
 use tracing::{error, info, debug, trace, warn};
@@ -49,6 +52,15 @@ impl Default for RetentionConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HMAC-SHA256 signing config — populated from <LogSigning> in log4j2.xml
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct SigningConfig {
+    key: Vec<u8>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Global config (written by rlog_configure, consumed once by LOG_SENDER init)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -61,6 +73,7 @@ struct BackgroundConfig {
     has_console:    bool,
     format:         LogFormat,
     retention:      RetentionConfig,
+    signing:        Option<SigningConfig>,
 }
 
 struct RlogConfig {
@@ -70,6 +83,7 @@ struct RlogConfig {
     has_console:    bool,
     format:         LogFormat,
     retention:      RetentionConfig,
+    signing:        Option<SigningConfig>,
 }
 
 lazy_static! {
@@ -80,6 +94,7 @@ lazy_static! {
         has_console:    false,
         format:         LogFormat::Text,
         retention:      RetentionConfig::default(),
+        signing:        None,
     });
 }
 
@@ -96,6 +111,7 @@ enum LogEvent {
 // Crash-recovery flag: tracing-subscriber can only be initialised once globally.
 // ─────────────────────────────────────────────────────────────────────────────
 static TRACING_INIT: AtomicBool = AtomicBool::new(false);
+static LOG_SEQUENCE: AtomicU64  = AtomicU64::new(1);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility helpers
@@ -226,6 +242,25 @@ fn format_panic_msg(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<&str>()  { return s.to_string(); }
     if let Some(s) = e.downcast_ref::<String>() { return s.clone(); }
     "unknown panic payload".to_string()
+}
+
+fn hmac_sha256_b64(key: &[u8], data: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .expect("HMAC accepts any key size");
+    mac.update(data.as_bytes());
+    BASE64_STD.encode(mac.finalize().into_bytes())
+}
+
+fn load_signing_key(raw: &str) -> Vec<u8> {
+    if let Some(hex) = raw.strip_prefix("hex:") {
+        (0..hex.len()).step_by(2)
+            .filter_map(|i| u8::from_str_radix(hex.get(i..i+2).unwrap_or(""), 16).ok())
+            .collect()
+    } else if let Some(b64) = raw.strip_prefix("b64:") {
+        BASE64_STD.decode(b64.trim()).unwrap_or_else(|_| b64.as_bytes().to_vec())
+    } else {
+        raw.as_bytes().to_vec()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,6 +444,7 @@ fn run_structured_loop(
     receiver: crossbeam_channel::Receiver<LogEvent>,
     mut writers: Vec<Box<dyn Write + Send>>,
     format: LogFormat,
+    signing: Option<SigningConfig>,
 ) {
     while let Ok(event) = receiver.recv() {
         match event {
@@ -416,6 +452,7 @@ fn run_structured_loop(
                 let ts  = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 let lvl = level_name(level);
                 let mdc = context.as_deref().map(parse_mdc_json).unwrap_or_default();
+                let seq = signing.as_ref().map(|_| LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed));
 
                 let line: String = match format {
                     LogFormat::Json => {
@@ -424,7 +461,16 @@ fn run_structured_loop(
                             json_escape(&message)
                         );
                         for (k, v) in &mdc { s.push_str(&format!(",\"{}\":\"{}\"", json_escape(k), json_escape(v))); }
-                        s.push_str("}\n"); s
+                        if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
+                            s.push_str(&format!(",\"_seq\":{}", n));
+                            s.push('}');
+                            let sig = hmac_sha256_b64(&sc.key, &s);
+                            s.pop();
+                            s.push_str(&format!(",\"_sig\":\"{}\"}}\n", sig));
+                        } else {
+                            s.push_str("}\n");
+                        }
+                        s
                     }
                     LogFormat::Xml => {
                         let mut s = format!(
@@ -436,12 +482,24 @@ fn run_structured_loop(
                             for (k, v) in &mdc { s.push_str(&format!("<entry key=\"{}\" value=\"{}\"/>", xml_escape(k), xml_escape(v))); }
                             s.push_str("</context>");
                         }
-                        s.push_str("</event>\n"); s
+                        if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
+                            s.push_str(&format!("<seq>{}</seq>", n));
+                            let sig = hmac_sha256_b64(&sc.key, &s);
+                            s.push_str(&format!("<sig>{}</sig>", sig));
+                        }
+                        s.push_str("</event>\n");
+                        s
                     }
                     LogFormat::Logfmt => {
                         let mut s = format!("ts={ts} level={lvl} msg={}", logfmt_quote(&message));
                         for (k, v) in &mdc { s.push_str(&format!(" {}={}", k, logfmt_quote(v))); }
-                        s.push('\n'); s
+                        if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
+                            s.push_str(&format!(" _seq={}", n));
+                            let sig = hmac_sha256_b64(&sc.key, &s);
+                            s.push_str(&format!(" _sig={}", sig));
+                        }
+                        s.push('\n');
+                        s
                     }
                     LogFormat::Text => unreachable!(),
                 };
@@ -492,11 +550,24 @@ fn run_background(
             match event {
                 LogEvent::Message { level, message, context } => {
                     let mdc = context.as_deref().map(parse_mdc_json).unwrap_or_default();
+                    let mut mdc_suffix = String::new();
+                    for (k, v) in &mdc { mdc_suffix.push_str(&format!(" {}={}", k, v)); }
+
+                    // Compute signing suffix once; reuse for both console and file outputs.
+                    // Canonical form covers level + message + MDC + seq (no timestamp so
+                    // both outputs carry an identical, verifiable signature).
+                    let sig_suffix = cfg.signing.as_ref().map(|sc| {
+                        let seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                        let canonical = format!("{} {}{} _seq={}", level_name(level), message, mdc_suffix, seq);
+                        let sig = hmac_sha256_b64(&sc.key, &canonical);
+                        format!(" _seq={} _sig={}", seq, sig)
+                    });
 
                     // Console
                     if cfg.has_console {
                         let mut full = message.clone();
-                        for (k, v) in &mdc { full.push_str(&format!(" {}={}", k, v)); }
+                        full.push_str(&mdc_suffix);
+                        if let Some(ref ss) = sig_suffix { full.push_str(ss); }
 
                         if use_tracing {
                             match level {
@@ -505,7 +576,6 @@ fn run_background(
                                 _ => error!("{}", full),
                             }
                         } else {
-                            // Post-panic fallback — tracing subscriber state may be broken
                             let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                             eprintln!("{} {:5} {}", ts, level_name(level), full);
                         }
@@ -515,8 +585,8 @@ fn run_background(
                     if let Some(ref mut fw) = file_writer {
                         let ts  = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                         let lvl = level_name(level);
-                        let mut line = format!("{} {:5} {}", ts, lvl, message);
-                        for (k, v) in &mdc { line.push_str(&format!(" {}={}", k, v)); }
+                        let mut line = format!("{} {:5} {}{}", ts, lvl, message, mdc_suffix);
+                        if let Some(ref ss) = sig_suffix { line.push_str(ss); }
                         line.push('\n');
                         let _ = fw.write_all(line.as_bytes());
                     }
@@ -539,7 +609,7 @@ fn run_background(
             }
         }
         if writers.is_empty() { writers.push(Box::new(io::stdout())); }
-        run_structured_loop(receiver, writers, cfg.format);
+        run_structured_loop(receiver, writers, cfg.format, cfg.signing);
     }
 }
 
@@ -568,6 +638,7 @@ lazy_static! {
                 has_console:    c.has_console,
                 format:         c.format.clone(),
                 retention:      c.retention.clone(),
+                signing:        c.signing.clone(),
             }
         };
 
@@ -740,6 +811,36 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                                     };
                                 }
                             }
+                        }
+                    }
+                    "logsigning" => {
+                        let mut key_bytes: Option<Vec<u8>> = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"keyEnv" => {
+                                    if let Ok(var) = String::from_utf8(attr.value.into_owned()) {
+                                        if let Ok(val) = std::env::var(var.trim()) {
+                                            key_bytes = Some(load_signing_key(&val));
+                                        }
+                                    }
+                                }
+                                b"keyFile" => {
+                                    if let Ok(path) = String::from_utf8(attr.value.into_owned()) {
+                                        if let Ok(content) = fs::read_to_string(path.trim()) {
+                                            key_bytes = Some(load_signing_key(content.trim()));
+                                        }
+                                    }
+                                }
+                                b"keyHex" => {
+                                    if let Ok(hex) = String::from_utf8(attr.value.into_owned()) {
+                                        key_bytes = Some(load_signing_key(&format!("hex:{}", hex.trim())));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(k) = key_bytes {
+                            config.signing = Some(SigningConfig { key: k });
                         }
                     }
                     _ => {}
