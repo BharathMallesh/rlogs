@@ -399,11 +399,16 @@ impl Write for ManagedRollingFile {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn compress_file(path: &Path) -> io::Result<()> {
+    // Guard: file may have been deleted between roll() and when this thread ran.
+    if !path.exists() { return Ok(()); }
     let gz_path = PathBuf::from(format!("{}.gz", path.display()));
     let input   = File::open(path)?;
     let output  = File::create(&gz_path)?;
     let mut enc = GzEncoder::new(output, Compression::default());
-    io::copy(&mut io::BufReader::new(input), &mut enc)?;
+    if let Err(e) = io::copy(&mut io::BufReader::new(input), &mut enc) {
+        let _ = fs::remove_file(&gz_path); // clean up partial .gz on error
+        return Err(e);
+    }
     enc.finish()?;
     fs::remove_file(path)
 }
