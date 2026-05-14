@@ -74,6 +74,7 @@ struct BackgroundConfig {
     format:         LogFormat,
     retention:      RetentionConfig,
     signing:        Option<SigningConfig>,
+    node_id:        String,
 }
 
 struct RlogConfig {
@@ -84,6 +85,7 @@ struct RlogConfig {
     format:         LogFormat,
     retention:      RetentionConfig,
     signing:        Option<SigningConfig>,
+    node_id:        String,
 }
 
 lazy_static! {
@@ -95,6 +97,7 @@ lazy_static! {
         format:         LogFormat::Text,
         retention:      RetentionConfig::default(),
         signing:        None,
+        node_id:        get_node_id(),
     });
 }
 
@@ -236,6 +239,22 @@ fn time_key_now(policy: &RollingPolicy) -> String {
         RollingPolicy::Daily  => now.format("%Y-%m-%d").to_string(),
         RollingPolicy::Hourly => now.format("%Y-%m-%dT%H").to_string(),
     }
+}
+
+/// Best-effort node identifier for multi-node log correlation.
+/// Priority: NODE_ID env → HOSTNAME env → COMPUTERNAME (Windows) → /etc/hostname → "localhost"
+fn get_node_id() -> String {
+    for var in &["NODE_ID", "HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_string();
+            if !v.is_empty() { return v; }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim().to_string();
+        if !s.is_empty() { return s; }
+    }
+    "localhost".to_string()
 }
 
 fn format_panic_msg(e: &Box<dyn std::any::Any + Send>) -> String {
@@ -445,6 +464,7 @@ fn run_structured_loop(
     mut writers: Vec<Box<dyn Write + Send>>,
     format: LogFormat,
     signing: Option<SigningConfig>,
+    node_id: String,
 ) {
     while let Ok(event) = receiver.recv() {
         match event {
@@ -457,7 +477,8 @@ fn run_structured_loop(
                 let line: String = match format {
                     LogFormat::Json => {
                         let mut s = format!(
-                            "{{\"@timestamp\":\"{ts}\",\"level\":\"{lvl}\",\"message\":\"{}\"",
+                            "{{\"@timestamp\":\"{ts}\",\"level\":\"{lvl}\",\"nodeId\":\"{}\",\"message\":\"{}\"",
+                            json_escape(&node_id),
                             json_escape(&message)
                         );
                         for (k, v) in &mdc { s.push_str(&format!(",\"{}\":\"{}\"", json_escape(k), json_escape(v))); }
@@ -474,7 +495,8 @@ fn run_structured_loop(
                     }
                     LogFormat::Xml => {
                         let mut s = format!(
-                            "<event timestamp=\"{ts}\" level=\"{lvl}\"><message>{}</message>",
+                            "<event timestamp=\"{ts}\" level=\"{lvl}\" nodeId=\"{}\"><message>{}</message>",
+                            xml_escape(&node_id),
                             xml_escape(&message)
                         );
                         if !mdc.is_empty() {
@@ -491,7 +513,9 @@ fn run_structured_loop(
                         s
                     }
                     LogFormat::Logfmt => {
-                        let mut s = format!("ts={ts} level={lvl} msg={}", logfmt_quote(&message));
+                        let mut s = format!("ts={ts} level={lvl} nodeId={} msg={}",
+                            logfmt_quote(&node_id),
+                            logfmt_quote(&message));
                         for (k, v) in &mdc { s.push_str(&format!(" {}={}", k, logfmt_quote(v))); }
                         if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
                             s.push_str(&format!(" _seq={}", n));
@@ -558,14 +582,14 @@ fn run_background(
                     // both outputs carry an identical, verifiable signature).
                     let sig_suffix = cfg.signing.as_ref().map(|sc| {
                         let seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                        let canonical = format!("{} {}{} _seq={}", level_name(level), message, mdc_suffix, seq);
+                        let canonical = format!("{} [{}] {}{} _seq={}", level_name(level), cfg.node_id, message, mdc_suffix, seq);
                         let sig = hmac_sha256_b64(&sc.key, &canonical);
                         format!(" _seq={} _sig={}", seq, sig)
                     });
 
                     // Console
                     if cfg.has_console {
-                        let mut full = message.clone();
+                        let mut full = format!("[{}] {}", cfg.node_id, message);
                         full.push_str(&mdc_suffix);
                         if let Some(ref ss) = sig_suffix { full.push_str(ss); }
 
@@ -585,7 +609,7 @@ fn run_background(
                     if let Some(ref mut fw) = file_writer {
                         let ts  = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                         let lvl = level_name(level);
-                        let mut line = format!("{} {:5} {}{}", ts, lvl, message, mdc_suffix);
+                        let mut line = format!("{} {:5} [{}] {}{}", ts, lvl, cfg.node_id, message, mdc_suffix);
                         if let Some(ref ss) = sig_suffix { line.push_str(ss); }
                         line.push('\n');
                         let _ = fw.write_all(line.as_bytes());
@@ -609,7 +633,7 @@ fn run_background(
             }
         }
         if writers.is_empty() { writers.push(Box::new(io::stdout())); }
-        run_structured_loop(receiver, writers, cfg.format, cfg.signing);
+        run_structured_loop(receiver, writers, cfg.format, cfg.signing, cfg.node_id);
     }
 }
 
@@ -639,6 +663,7 @@ lazy_static! {
                 format:         c.format.clone(),
                 retention:      c.retention.clone(),
                 signing:        c.signing.clone(),
+                node_id:        c.node_id.clone(),
             }
         };
 
@@ -812,6 +837,42 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                                 }
                             }
                         }
+                    }
+                    "nodeid" => {
+                        // <NodeId value="payment-node-1"/>
+                        // <NodeId env="NODE_ID" default="node0"/>
+                        let mut value_attr:   Option<String> = None;
+                        let mut env_attr:     Option<String> = None;
+                        let mut default_attr: Option<String> = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"value" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        value_attr = Some(v);
+                                    }
+                                }
+                                b"env" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        env_attr = Some(v);
+                                    }
+                                }
+                                b"default" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        default_attr = Some(v);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(v) = value_attr {
+                            config.node_id = v;
+                        } else if let Some(var) = env_attr {
+                            config.node_id = std::env::var(var.trim())
+                                .unwrap_or_else(|_| default_attr.unwrap_or_else(|| config.node_id.clone()));
+                        } else if let Some(d) = default_attr {
+                            config.node_id = d;
+                        }
+                        // No attributes → keep auto-detected hostname
                     }
                     "logsigning" => {
                         let mut key_bytes: Option<Vec<u8>> = None;
