@@ -68,13 +68,44 @@ public class RlogLogger extends AbstractLogger {
             formattedMsg += " | Exception: " + t.toString();
         }
         
-        // Extract MDC context
+        // Serialize MDC as a JSON object so all output formats (JSON, XML, Logfmt, Text)
+        // can parse it unambiguously in Rust. Null when the context map is empty.
         java.util.Map<String, String> contextMap = org.apache.logging.log4j.ThreadContext.getContext();
-        String mdcString = null;
-        if (contextMap != null && !contextMap.isEmpty()) {
-            mdcString = contextMap.toString();
-        }
-        
+        String mdcString = (contextMap != null && !contextMap.isEmpty())
+                ? mdcToJson(contextMap) : null;
+
         NativeLogger.log(rustLevel, formattedMsg, mdcString);
+    }
+
+    /** Serialize an MDC map to a compact JSON object string: {"key":"value",...} */
+    private static String mdcToJson(java.util.Map<String, String> mdc) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (java.util.Map.Entry<String, String> e : mdc.entrySet()) {
+            if (!first) sb.append(',');
+            sb.append('"').append(jsonEscape(e.getKey()))
+              .append("\":\"").append(jsonEscape(e.getValue())).append('"');
+            first = false;
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    private static String jsonEscape(String s) {
+        StringBuilder out = new StringBuilder(s.length() + 4);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':  out.append("\\\""); break;
+                case '\\': out.append("\\\\"); break;
+                case '\n': out.append("\\n");  break;
+                case '\r': out.append("\\r");  break;
+                case '\t': out.append("\\t");  break;
+                default:
+                    if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                    else          out.append(c);
+            }
+        }
+        return out.toString();
     }
 }
