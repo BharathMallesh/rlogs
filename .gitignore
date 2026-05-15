@@ -10,3 +10,6 @@ rlog4j-api/build/
 .DS_Store
 gradle-8.7-bin.zip
 gradle-8.7/
+.idea/
+logs/
+rlog-core/logs/

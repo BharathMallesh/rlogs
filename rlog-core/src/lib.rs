@@ -75,6 +75,7 @@ struct BackgroundConfig {
     retention:      RetentionConfig,
     signing:        Option<SigningConfig>,
     node_id:        String,
+    has_node_id:    bool,
 }
 
 struct RlogConfig {
@@ -86,6 +87,7 @@ struct RlogConfig {
     retention:      RetentionConfig,
     signing:        Option<SigningConfig>,
     node_id:        String,
+    has_node_id:    bool,
 }
 
 lazy_static! {
@@ -98,6 +100,7 @@ lazy_static! {
         retention:      RetentionConfig::default(),
         signing:        None,
         node_id:        get_node_id(),
+        has_node_id:    true,
     });
 }
 
@@ -136,6 +139,10 @@ fn resolve_env_expr(s: &str) -> String {
         result = format!("{}{}{}", &result[..start], resolved, &result[end + 1..]);
     }
     result
+}
+
+fn parse_bool(s: &str) -> bool {
+    matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "yes")
 }
 
 fn parse_size(s: &str) -> u64 {
@@ -481,6 +488,7 @@ fn run_structured_loop(
     format: LogFormat,
     signing: Option<SigningConfig>,
     node_id: String,
+    has_node_id: bool,
 ) {
     while let Ok(event) = receiver.recv() {
         match event {
@@ -492,11 +500,18 @@ fn run_structured_loop(
 
                 let line: String = match format {
                     LogFormat::Json => {
-                        let mut s = format!(
-                            "{{\"@timestamp\":\"{ts}\",\"level\":\"{lvl}\",\"nodeId\":\"{}\",\"message\":\"{}\"",
-                            json_escape(&node_id),
-                            json_escape(&message)
-                        );
+                        let mut s = if has_node_id {
+                            format!(
+                                "{{\"@timestamp\":\"{ts}\",\"level\":\"{lvl}\",\"nodeId\":\"{}\",\"message\":\"{}\"",
+                                json_escape(&node_id),
+                                json_escape(&message)
+                            )
+                        } else {
+                            format!(
+                                "{{\"@timestamp\":\"{ts}\",\"level\":\"{lvl}\",\"message\":\"{}\"",
+                                json_escape(&message)
+                            )
+                        };
                         for (k, v) in &mdc { s.push_str(&format!(",\"{}\":\"{}\"", json_escape(k), json_escape(v))); }
                         if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
                             s.push_str(&format!(",\"_seq\":{}", n));
@@ -510,11 +525,18 @@ fn run_structured_loop(
                         s
                     }
                     LogFormat::Xml => {
-                        let mut s = format!(
-                            "<event timestamp=\"{ts}\" level=\"{lvl}\" nodeId=\"{}\"><message>{}</message>",
-                            xml_escape(&node_id),
-                            xml_escape(&message)
-                        );
+                        let mut s = if has_node_id {
+                            format!(
+                                "<event timestamp=\"{ts}\" level=\"{lvl}\" nodeId=\"{}\"><message>{}</message>",
+                                xml_escape(&node_id),
+                                xml_escape(&message)
+                            )
+                        } else {
+                            format!(
+                                "<event timestamp=\"{ts}\" level=\"{lvl}\"><message>{}</message>",
+                                xml_escape(&message)
+                            )
+                        };
                         if !mdc.is_empty() {
                             s.push_str("<context>");
                             for (k, v) in &mdc { s.push_str(&format!("<entry key=\"{}\" value=\"{}\"/>", xml_escape(k), xml_escape(v))); }
@@ -529,9 +551,13 @@ fn run_structured_loop(
                         s
                     }
                     LogFormat::Logfmt => {
-                        let mut s = format!("ts={ts} level={lvl} nodeId={} msg={}",
-                            logfmt_quote(&node_id),
-                            logfmt_quote(&message));
+                        let mut s = if has_node_id {
+                            format!("ts={ts} level={lvl} nodeId={} msg={}",
+                                logfmt_quote(&node_id),
+                                logfmt_quote(&message))
+                        } else {
+                            format!("ts={ts} level={lvl} msg={}", logfmt_quote(&message))
+                        };
                         for (k, v) in &mdc { s.push_str(&format!(" {}={}", k, logfmt_quote(v))); }
                         if let (Some(sc), Some(n)) = (signing.as_ref(), seq) {
                             s.push_str(&format!(" _seq={}", n));
@@ -649,7 +675,7 @@ fn run_background(
             }
         }
         if writers.is_empty() { writers.push(Box::new(io::stdout())); }
-        run_structured_loop(receiver, writers, cfg.format, cfg.signing, cfg.node_id);
+        run_structured_loop(receiver, writers, cfg.format, cfg.signing, cfg.node_id, cfg.has_node_id);
     }
 }
 
@@ -680,6 +706,7 @@ lazy_static! {
                 retention:      c.retention.clone(),
                 signing:        c.signing.clone(),
                 node_id:        c.node_id.clone(),
+                has_node_id:    c.has_node_id,
             }
         };
 
@@ -755,10 +782,50 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
             Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
                 match tag.as_str() {
-                    "jsonlayout"   => { config.format = LogFormat::Json; }
-                    "xmllayout"    => { config.format = LogFormat::Xml; }
-                    "logfmtlayout" => { config.format = LogFormat::Logfmt; }
-                    "console"      => { config.has_console = true; }
+                    "jsonlayout" => {
+                        let mut enabled = true;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"enabled" {
+                                if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                    enabled = parse_bool(&resolve_env_expr(&v));
+                                }
+                            }
+                        }
+                        if enabled { config.format = LogFormat::Json; }
+                    }
+                    "xmllayout" => {
+                        let mut enabled = true;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"enabled" {
+                                if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                    enabled = parse_bool(&resolve_env_expr(&v));
+                                }
+                            }
+                        }
+                        if enabled { config.format = LogFormat::Xml; }
+                    }
+                    "logfmtlayout" => {
+                        let mut enabled = true;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"enabled" {
+                                if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                    enabled = parse_bool(&resolve_env_expr(&v));
+                                }
+                            }
+                        }
+                        if enabled { config.format = LogFormat::Logfmt; }
+                    }
+                    "console" => {
+                        let mut enabled = true;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"enabled" {
+                                if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                    enabled = parse_bool(&resolve_env_expr(&v));
+                                }
+                            }
+                        }
+                        if enabled { config.has_console = true; }
+                    }
                     "file" => {
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"fileName" {
@@ -818,27 +885,42 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                         }
                     }
                     "retentionpolicy" => {
+                        let mut enabled = true;
+                        let mut retention_days: Option<u64> = None;
+                        let mut archive_path: Option<PathBuf> = None;
+                        let mut compress: Option<bool> = None;
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
+                                b"enabled" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        enabled = parse_bool(&resolve_env_expr(&v));
+                                    }
+                                }
                                 b"retentionDays" => {
                                     if let Ok(s) = String::from_utf8(attr.value.into_owned()) {
-                                        config.retention.retention_days = s.trim().parse().unwrap_or(0);
+                                        let resolved = resolve_env_expr(&s);
+                                        retention_days = resolved.trim().parse().ok();
                                     }
                                 }
                                 b"archivePath" => {
                                     if let Ok(raw) = String::from_utf8(attr.value.into_owned()) {
                                         let r = resolve_env_expr(&raw);
-                                        if !r.is_empty() { config.retention.archive_path = Some(PathBuf::from(r)); }
+                                        if !r.is_empty() { archive_path = Some(PathBuf::from(r)); }
                                     }
                                 }
                                 b"compress" => {
                                     if let Ok(s) = String::from_utf8(attr.value.into_owned()) {
-                                        let v = s.trim();
-                                        config.retention.compress = v != "0" && v.to_lowercase() != "false";
+                                        let resolved = resolve_env_expr(&s);
+                                        compress = Some(parse_bool(&resolved));
                                     }
                                 }
                                 _ => {}
                             }
+                        }
+                        if enabled {
+                            if let Some(d) = retention_days { config.retention.retention_days = d; }
+                            if let Some(p) = archive_path   { config.retention.archive_path = Some(p); }
+                            if let Some(c) = compress       { config.retention.compress = c; }
                         }
                     }
                     "root" => {
@@ -855,16 +937,22 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                         }
                     }
                     "nodeid" => {
-                        // <NodeId value="payment-node-1"/>
-                        // <NodeId env="NODE_ID" default="node0"/>
+                        // <NodeId enabled="${env:RLOG_NODE_ID:-true}" value="payment-node-1"/>
+                        // <NodeId enabled="true" env="NODE_ID" default="node0"/>
+                        let mut enabled      = true;
                         let mut value_attr:   Option<String> = None;
                         let mut env_attr:     Option<String> = None;
                         let mut default_attr: Option<String> = None;
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
+                                b"enabled" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        enabled = parse_bool(&resolve_env_expr(&v));
+                                    }
+                                }
                                 b"value" => {
                                     if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
-                                        value_attr = Some(v);
+                                        value_attr = Some(resolve_env_expr(&v));
                                     }
                                 }
                                 b"env" => {
@@ -874,36 +962,49 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                                 }
                                 b"default" => {
                                     if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
-                                        default_attr = Some(v);
+                                        default_attr = Some(resolve_env_expr(&v));
                                     }
                                 }
                                 _ => {}
                             }
                         }
-                        if let Some(v) = value_attr {
-                            config.node_id = v;
-                        } else if let Some(var) = env_attr {
-                            config.node_id = std::env::var(var.trim())
-                                .unwrap_or_else(|_| default_attr.unwrap_or_else(|| config.node_id.clone()));
-                        } else if let Some(d) = default_attr {
-                            config.node_id = d;
+                        if enabled {
+                            if let Some(v) = value_attr {
+                                config.node_id = v;
+                            } else if let Some(var) = env_attr {
+                                config.node_id = std::env::var(var.trim())
+                                    .unwrap_or_else(|_| default_attr.unwrap_or_else(|| config.node_id.clone()));
+                            } else if let Some(d) = default_attr {
+                                config.node_id = d;
+                            }
+                            config.has_node_id = true;
+                        } else {
+                            config.has_node_id = false;
                         }
-                        // No attributes → keep auto-detected hostname
+                        // no attributes → keep auto-detected hostname and default has_node_id=true
                     }
                     "logsigning" => {
+                        let mut enabled = true;
                         let mut key_bytes: Option<Vec<u8>> = None;
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
+                                b"enabled" => {
+                                    if let Ok(v) = String::from_utf8(attr.value.into_owned()) {
+                                        enabled = parse_bool(&resolve_env_expr(&v));
+                                    }
+                                }
                                 b"keyEnv" => {
                                     if let Ok(var) = String::from_utf8(attr.value.into_owned()) {
-                                        if let Ok(val) = std::env::var(var.trim()) {
+                                        let resolved = resolve_env_expr(&var);
+                                        if let Ok(val) = std::env::var(resolved.trim()) {
                                             key_bytes = Some(load_signing_key(&val));
                                         }
                                     }
                                 }
                                 b"keyFile" => {
                                     if let Ok(path) = String::from_utf8(attr.value.into_owned()) {
-                                        if let Ok(content) = fs::read_to_string(path.trim()) {
+                                        let resolved = resolve_env_expr(&path);
+                                        if let Ok(content) = fs::read_to_string(resolved.trim()) {
                                             key_bytes = Some(load_signing_key(content.trim()));
                                         }
                                     }
@@ -916,8 +1017,10 @@ pub extern "C" fn rlog_configure(xml_ptr: *const c_char) -> i32 {
                                 _ => {}
                             }
                         }
-                        if let Some(k) = key_bytes {
-                            config.signing = Some(SigningConfig { key: k });
+                        if enabled {
+                            if let Some(k) = key_bytes {
+                                config.signing = Some(SigningConfig { key: k });
+                            }
                         }
                     }
                     _ => {}
