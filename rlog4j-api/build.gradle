@@ -10,9 +10,20 @@ repositories {
     mavenCentral()
 }
 
+// Base compilation targets Java 11 (JNI path, compatible with Java 8+)
 java {
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+// Java 22 source set for the FFM override (Multi-Release JAR)
+sourceSets {
+    java22 {
+        java {
+            srcDir 'src/main/java22'
+        }
+        compileClasspath += main.compileClasspath + main.output
+    }
 }
 
 dependencies {
@@ -21,9 +32,23 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
+// Compile the Java 22 source set with --release 22
+compileJava22Java {
+    options.release = 22
+}
+
+// Bundle base classes + Java 22 classes under META-INF/versions/22/
+jar {
+    manifest {
+        attributes 'Multi-Release': 'true'
+    }
+    into('META-INF/versions/22') {
+        from sourceSets.java22.output
+    }
+}
+
 test {
     useJUnitPlatform()
-    // FFM might require native access enablement depending on module structure
     jvmArgs += ["--enable-native-access=ALL-UNNAMED"]
 }
 

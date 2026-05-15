@@ -953,3 +953,64 @@ pub extern "C" fn rlog_flush() {
     let _ = LOG_SENDER.send(LogEvent::Flush(ack_tx));
     let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JNI entry points — thin wrappers used by Java 8–21 (before FFM is available).
+// Java 22+ uses the FFM path in NativeLogger.java instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use jni::JNIEnv;
+use jni::objects::{JClass, JString};
+use jni::sys::jint;
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLoggerJNI_rlogConfigure<'local>(
+    mut env: JNIEnv<'local>, _class: JClass<'local>, xml: JString<'local>,
+) -> jint {
+    match env.get_string(&xml) {
+        Ok(s) => {
+            let xml_string: String = s.into();
+            match std::ffi::CString::new(xml_string) {
+                Ok(c) => rlog_configure(c.as_ptr()),
+                Err(_) => -1,
+            }
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLoggerJNI_rlogInit<'local>(
+    _env: JNIEnv<'local>, _class: JClass<'local>,
+) -> jint {
+    rlog_init()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLoggerJNI_rlogLog<'local>(
+    mut env: JNIEnv<'local>, _class: JClass<'local>,
+    level: jint, message: JString<'local>, mdc: JString<'local>,
+) {
+    let msg: String = match env.get_string(&message) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    // mdc may be null (Java passes null when ThreadContext is empty)
+    let context: Option<String> = if mdc.is_null() {
+        None
+    } else {
+        env.get_string(&mdc).ok().map(|s| s.into())
+    };
+    if let Err(e) = LOG_SENDER.send(LogEvent::Message { level, message: msg, context }) {
+        if let LogEvent::Message { level, message, .. } = e.into_inner() {
+            eprintln!("rlog: CRITICAL [{}] {} — channel dead, wrote to stderr", level_name(level), message);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_logging_log4j_core_NativeLoggerJNI_rlogFlush<'local>(
+    _env: JNIEnv<'local>, _class: JClass<'local>,
+) {
+    rlog_flush();
+}
