@@ -402,7 +402,12 @@ fn compress_file(path: &Path) -> io::Result<()> {
     // Guard: file may have been deleted between roll() and when this thread ran.
     if !path.exists() { return Ok(()); }
     let gz_path = PathBuf::from(format!("{}.gz", path.display()));
-    let input   = File::open(path)?;
+    // TOCTOU: exists() + open() are not atomic — handle NotFound on open() too.
+    let input = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let output  = File::create(&gz_path)?;
     let mut enc = GzEncoder::new(output, Compression::default());
     if let Err(e) = io::copy(&mut io::BufReader::new(input), &mut enc) {
@@ -410,7 +415,13 @@ fn compress_file(path: &Path) -> io::Result<()> {
         return Err(e);
     }
     enc.finish()?;
-    fs::remove_file(path)
+    // If the original was deleted by retention while we were compressing it, that's fine.
+    if let Err(e) = fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 fn apply_retention(
